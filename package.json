@@ -9,7 +9,7 @@
   "homepage": "https://www.glam.systems",
   "repository": {
     "type": "git",
-    "url": "https://github.com/glamsystems/glam-cli.git"
+    "url": "https://github.com/glamsystems/glam-cli-legacy.git"
   },
   "keywords": [
     "glam",
