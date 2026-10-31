@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    ".github/CLI_RELEASES.md",
+    ".github/workflows/publish.yml",
+    "scripts/release-cli.mjs",
+    "scripts/tests/release-cli.test.mjs"
+  ]
+}

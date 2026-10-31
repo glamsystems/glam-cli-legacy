@@ -1,5 +1,8 @@
 name: Publish npm package
 
+# Runs at the immutable release tag the private controller created. A manual
+# retry at the same tag skips publishing only when the existing npm artifact
+# matches the built package and this commit.
 on:
   push:
     tags:
@@ -16,115 +19,46 @@ concurrency:
 
 jobs:
   publish:
+    name: Publish CLI
+    if: vars.CLI_RELEASE_PUBLISH_ENABLED == 'true' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     environment: npm-production
+    permissions:
+      contents: write
+      id-token: write
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          cache: "npm"
 
-      - name: Use npm with trusted publishing support
-        # npm 12.0.0 installs sigstore under the workspace copy of libnpmpublish,
-        # but npm publish --provenance loads the runtime copy and fails to resolve it.
+      - name: Pin npm for trusted publishing
         run: npm install -g npm@11.18.0
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
-      - name: Validate release ref
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PACKAGE_NAME="$(node -p "require('./package.json').name")"
-          VERSION="$(node -p "require('./package.json').version")"
-
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "Release commit must be on origin/main" >&2
-            exit 1
-          fi
-
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${VERSION}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package version v${VERSION}" >&2
-            exit 1
-          fi
-
-          if npm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
-            echo "${PACKAGE_NAME}@${VERSION} already exists on npm" >&2
-            exit 1
-          fi
+      - name: Validate the release ref
+        run: node scripts/release-cli.mjs validate
 
       - name: Build package
         run: npm run build
 
-      - name: Dry-run pack
-        run: npm pack --dry-run --json > npm-pack-dry-run.json
+      - name: Publish or confirm the existing artifact
+        run: node scripts/release-cli.mjs publish
 
-      - name: Upload pack manifest
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-pack-dry-run
-          path: npm-pack-dry-run.json
+      - name: Verify installation, signatures and provenance
+        run: node scripts/release-cli.mjs verify
 
-      - name: Publish
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          VERSION="$(node -p "require('./package.json').version")"
-          DIST_TAG="latest"
-
-          if [[ "${VERSION}" == *"-test"* ]]; then
-            DIST_TAG="test"
-          fi
-
-          npm publish --access public --provenance --tag "${DIST_TAG}"
-
-      - name: Verify published signatures
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PACKAGE_NAME="$(node -p "require('./package.json').name")"
-          VERSION="$(node -p "require('./package.json').version")"
-          TMP_DIR="$(mktemp -d)"
-
-          cd "${TMP_DIR}"
-          npm init -y
-
-          # Registry read replicas can lag npm publish by several minutes;
-          # poll cheaply with npm view before attempting the install.
-          for attempt in {1..20}; do
-            if npm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
-              break
-            fi
-
-            if [[ "${attempt}" == "20" ]]; then
-              echo "${PACKAGE_NAME}@${VERSION} not visible on registry after 10 minutes" >&2
-              exit 1
-            fi
-
-            sleep 30
-          done
-
-          for attempt in {1..5}; do
-            if npm install "${PACKAGE_NAME}@${VERSION}"; then
-              break
-            fi
-
-            if [[ "${attempt}" == "5" ]]; then
-              exit 1
-            fi
-
-            sleep 30
-          done
-
-          npm audit signatures
+      - name: Complete the public GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/release-cli.mjs release

@@ -4,6 +4,8 @@
 
 Command-line interface for managing GLAM vaults.
 
+This is the legacy CLI line (`@glamsystems/glam-cli`); its successor is the Kit CLI, `@glam/cli`, once published.
+
 **Note:** This repository is automatically synced from GLAM's private monorepo. Pull requests cannot be accepted here, but we welcome bug reports and feature requests through GitHub Issues.
 
 ## Installation

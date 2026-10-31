@@ -11,6 +11,12 @@ import {
 } from "@solana/web3.js";
 import { Command } from "commander";
 
+// One version source: the package manifest, read at build time. The bump
+// script and release tooling change package.json only.
+const { version: cliVersion } = require("../package.json") as {
+  version: string;
+};
+
 import {
   CliConfig,
   markStagingOnlyCommand,
@@ -194,7 +200,7 @@ program
     );
     await idlCheck(context.glamClient);
   })
-  .version("1.1.4");
+  .version(cliVersion);
 
 program
   .command("env")
