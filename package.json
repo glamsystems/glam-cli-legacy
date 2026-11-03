@@ -1,6 +1,6 @@
 {
   "name": "@glamsystems/glam-cli",
-  "version": "1.1.4",
+  "version": "1.2.0",
   "description": "CLI for interacting with the GLAM Protocol",
   "main": "./main.js",
   "bin": {
