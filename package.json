@@ -34,7 +34,7 @@
   ],
   "dependencies": {
     "@ellipsis-labs/rise": "0.4.66",
-    "@glamsystems/glam-sdk": "1.1.2",
+    "@glamsystems/glam-sdk": "1.2.0",
     "commander": "11.1.0",
     "decimal.js": "10.6.0",
     "inquirer": "8.2.7"
