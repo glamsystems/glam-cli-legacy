@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // Publication steps for @glamsystems/glam-cli at an immutable release tag.
 // The private controller created the tag and .cli-release.json; this script
@@ -17,6 +18,7 @@ const run = (cmd, args, options = {}) =>
     stdio: ["ignore", "pipe", "inherit"],
     ...options,
   })?.trim();
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const fail = (message) => {
   console.error(message);
   process.exit(1);
@@ -89,10 +91,28 @@ async function publish() {
   );
 }
 
+// npm keeps processing a publish for some minutes before the version is
+// visible, so verification polls the registry before it judges.
+export async function waitForPackage({
+  lookup,
+  version,
+  delay = sleep,
+  attempts = 20,
+}) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const metadata = await lookup(version);
+    if (metadata) return metadata;
+    if (attempt < attempts) await delay(15_000);
+  }
+  throw new Error(`${PACKAGE}@${version} is not on npm`);
+}
+
 async function verify() {
   const { pkg, head } = context();
-  const metadata = await registry(pkg.version);
-  if (!metadata) fail(`${PACKAGE}@${pkg.version} is not on npm`);
+  const metadata = await waitForPackage({
+    lookup: registry,
+    version: pkg.version,
+  }).catch((error) => fail(error.message));
   if (
     metadata.gitHead !== head ||
     !metadata.dist?.integrity?.startsWith("sha512-") ||
@@ -182,10 +202,15 @@ async function release() {
   console.log(`GitHub Release ${tag} complete: ${existing.html_url}`);
 }
 
-const steps = { validate, publish, verify, release };
-const step = steps[process.argv[2]];
-if (!step)
-  fail(
-    "Usage: node scripts/release-cli.mjs validate | publish | verify | release",
-  );
-await step();
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  const steps = { validate, publish, verify, release };
+  const step = steps[process.argv[2]];
+  if (!step)
+    fail(
+      "Usage: node scripts/release-cli.mjs validate | publish | verify | release",
+    );
+  await step();
+}

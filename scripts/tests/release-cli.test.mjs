@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { waitForPackage } from "../release-cli.mjs";
 
 // Runs scripts/release-cli.mjs as publish.yml does, one step per process, with
 // git and npm replaced by recording fakes on PATH and fetch replaced by a
@@ -184,4 +185,37 @@ test("a retry after the publication landed skips publishing and completes verifi
     `npm install --ignore-scripts --no-audit --no-fund ${PACKAGE}@${VERSION}`,
     "npm audit signatures",
   ]);
+});
+
+test("verification waits until the published version becomes visible", async () => {
+  const metadata = { version: VERSION };
+  const answers = [null, null, metadata];
+  let delays = 0;
+  const found = await waitForPackage({
+    lookup: async () => answers.shift(),
+    version: VERSION,
+    delay: async (ms) => {
+      assert.equal(ms, 15_000);
+      delays++;
+    },
+  });
+  assert.equal(found, metadata);
+  assert.equal(delays, 2);
+});
+
+test("verification fails with the not on npm message once the attempts are exhausted", async () => {
+  let lookups = 0;
+  await assert.rejects(
+    waitForPackage({
+      lookup: async () => {
+        lookups++;
+        return null;
+      },
+      version: VERSION,
+      delay: async () => {},
+      attempts: 3,
+    }),
+    new RegExp(`${PACKAGE}@${VERSION} is not on npm`),
+  );
+  assert.equal(lookups, 3);
 });
