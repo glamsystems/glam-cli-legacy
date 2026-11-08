@@ -3,6 +3,7 @@
   "files": [
     ".github/CLI_RELEASES.md",
     ".github/workflows/publish.yml",
+    ".node-version",
     "scripts/release-cli.mjs",
     "scripts/tests/release-cli.test.mjs"
   ]

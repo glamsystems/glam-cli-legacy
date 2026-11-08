@@ -2,7 +2,7 @@ name: Publish npm package
 
 # Runs at the immutable release tag the private controller created. A manual
 # retry at the same tag skips publishing only when the existing npm artifact
-# matches the built package and this commit.
+# matches the packed tarball and this commit.
 on:
   push:
     tags:
@@ -11,37 +11,40 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: npm-publish-glam-cli-${{ github.ref }}
   cancel-in-progress: false
 
+# Only build runs the package's dependencies, and it holds no write permission.
+# publish holds the npm identity and a read-only token, installs nothing, and
+# publishes the tarball build reported. verify installs and loads the published
+# package with read access only. finish holds contents: write and runs no npm.
+# Every job runs the Node of .node-version and the npm bundled with it.
 jobs:
-  publish:
-    name: Publish CLI
+  build:
+    name: Build CLI
     if: vars.CLI_RELEASE_PUBLISH_ENABLED == 'true' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    environment: npm-production
-    permissions:
-      contents: write
-      id-token: write
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      integrity: ${{ steps.pack.outputs.integrity }}
     steps:
       - name: Checkout the release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Pin npm for trusted publishing
-        run: npm install -g npm@11.18.0
+          node-version-file: .node-version
+          package-manager-cache: false
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -49,16 +52,117 @@ jobs:
       - name: Validate the release ref
         run: node scripts/release-cli.mjs validate
 
+      # The package's prepack script is npm run build. The pack below skips
+      # lifecycle scripts, so the build runs here explicitly.
       - name: Build package
         run: npm run build
 
-      - name: Publish or confirm the existing artifact
+      - name: Pack the release tarball
+        id: pack
+        env:
+          RELEASE_PACK_DIR: ${{ runner.temp }}/release-pack
+        run: node scripts/release-cli.mjs pack
+
+      - name: Upload the release tarball and pack manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # A rerun of a failed publish job alone finds no artifact for its
+          # attempt. Re-run all jobs or dispatch at the tag instead.
+          name: release-tarball-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-pack
+          if-no-files-found: error
+
+  publish:
+    name: Publish CLI
+    needs: build
+    if: vars.CLI_RELEASE_PUBLISH_ENABLED == 'true' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: npm-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Validate the release ref
+        run: node scripts/release-cli.mjs validate
+
+      - name: Download the release tarball outside the checkout
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-tarball-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-tarball
+
+      - name: Publish the checked tarball or confirm the existing artifact
+        env:
+          RELEASE_TARBALL: ${{ runner.temp }}/release-tarball/${{ needs.build.outputs.tarball }}
+          RELEASE_INTEGRITY: ${{ needs.build.outputs.integrity }}
         run: node scripts/release-cli.mjs publish
 
+  verify:
+    name: Verify CLI
+    needs: [build, publish]
+    if: vars.CLI_RELEASE_PUBLISH_ENABLED == 'true' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
       - name: Verify installation, signatures and provenance
+        env:
+          RELEASE_INTEGRITY: ${{ needs.build.outputs.integrity }}
         run: node scripts/release-cli.mjs verify
+
+  finish:
+    name: Finish CLI release
+    needs: [build, verify]
+    if: vars.CLI_RELEASE_PUBLISH_ENABLED == 'true' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
 
       - name: Complete the public GitHub Release
         env:
+          RELEASE_INTEGRITY: ${{ needs.build.outputs.integrity }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/release-cli.mjs release
+        run: node scripts/release-cli.mjs finish
