@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "package": "@glamsystems/glam-cli",
+  "version": "1.2.1",
+  "source": {
+    "repository": "glamsystems/glam",
+    "commit": "070fa5a156af459296f086c32d83858941c9ae46"
+  },
+  "notes": "### Bug Fixes\n\n* **cli:** pin the SDK at 1.2.1 for the CLI release ([#1756](https://github.com/glamsystems/glam/issues/1756)) ([de6a886](https://github.com/glamsystems/glam/commit/de6a886d75399c498513042081b226635db5c1d2))"
+}
