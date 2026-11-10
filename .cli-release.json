@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "package": "@glamsystems/glam-cli",
+  "version": "1.2.2",
+  "source": {
+    "repository": "glamsystems/glam",
+    "commit": "bb929863ca7e7a348a3de1320b21ec3d53c7784a"
+  },
+  "notes": "### Bug Fixes\n\n* **cli:** declare bigint-buffer, which the bundle loads at runtime ([#1759](https://github.com/glamsystems/glam/issues/1759)) ([39bc9d2](https://github.com/glamsystems/glam/commit/39bc9d21845059ffab72c3aa3b44bce6dbd3b644))"
+}
