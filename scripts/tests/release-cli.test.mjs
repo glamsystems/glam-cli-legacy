@@ -14,11 +14,16 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
+import { COMMAND as CHECKED_COMMAND } from "../check-bundle.mjs";
 import {
+  COMMAND,
+  INSTALL_ATTEMPTS,
+  INSTALL_INTERVAL,
   NPM_CLI,
   NPM_ROOT,
   assertNpmEntries,
   assertNpmManifest,
+  installPublished,
   publishArgs,
   sri,
   tarballFiles,
@@ -56,9 +61,21 @@ case "$1" in
     printf '%s %s\\n' "$PWD" "$(ls -A)" >> "$FAKE_STATE/publish-directory"
     touch "$FAKE_STATE/published"; echo "+ $FAKE_PACKAGE@$FAKE_VERSION" ;;
   install)
-    mkdir -p "node_modules/$FAKE_PACKAGE"
+    # The bundle check installs the packed tarball, which the real npm does offline.
+    case "$*" in *.tgz) exec "$REAL_NPM" "$@" ;; esac
+    echo attempt >> "$FAKE_STATE/install-attempts"
+    if [ -n "$FAKE_INSTALL_ERROR" ]; then
+      echo "npm error code $FAKE_INSTALL_ERROR" >&2; exit 1
+    fi
+    mkdir -p "node_modules/$FAKE_PACKAGE" node_modules/.bin
     printf '{"name":"%s","version":"%s"}\\n' "$FAKE_PACKAGE" "$FAKE_VERSION" \\
       > "node_modules/$FAKE_PACKAGE/package.json"
+    printf '#!/usr/bin/env node\\nconsole.log(process.env.FAKE_INSTALLED_VERSION ?? process.env.FAKE_VERSION);\\n' \\
+      > "node_modules/$FAKE_PACKAGE/main.js"
+    chmod +x "node_modules/$FAKE_PACKAGE/main.js"
+    if [ -z "$FAKE_NO_COMMAND" ]; then
+      ln -s "../$FAKE_PACKAGE/main.js" node_modules/.bin/glam-cli
+    fi
     printf '{"packages":{"node_modules/%s":{"integrity":"%s"}}}\\n' "$FAKE_PACKAGE" \\
       "\${FAKE_LOCK_INTEGRITY:-$RELEASE_INTEGRITY}" > package-lock.json
     echo "added 1 package" ;;
@@ -134,14 +151,41 @@ function releaseScenario({ published = false, manifest = MANIFEST } = {}) {
   const work = join(root, "work");
   for (const directory of [bin, state, work, join(work, "templates")])
     mkdirSync(directory);
+  for (const loader of ["ws", "node-fetch"])
+    mkdirSync(join(work, "node_modules", loader), { recursive: true });
   writeFileSync(join(bin, "git"), FAKE_GIT);
-  writeFileSync(join(bin, "npm"), FAKE_NPM);
+  // The bundle check passes npm only PATH, HOME, TMPDIR and npm's own
+  // settings, so the fake carries its state folder and the real npm itself.
+  writeFileSync(
+    join(bin, "npm"),
+    FAKE_NPM.replace(
+      "#!/bin/sh\n",
+      `#!/bin/sh\n: "\${FAKE_STATE:=${state}}" "\${REAL_NPM:=${REAL_NPM}}"\n`,
+    ),
+  );
   chmodSync(join(bin, "git"), 0o755);
   chmodSync(join(bin, "npm"), 0o755);
   writeFileSync(join(root, "fetch.mjs"), FAKE_FETCH);
   for (const [path, content] of Object.entries({
     "package.json": `${JSON.stringify(manifest, null, 2)}\n`,
-    "main.js": "#!/usr/bin/env node\n",
+    // The bundle check starts it and leaves a mark if a workflow file reaches
+    // it. It reads package.json through fs, since the check refuses a path
+    // given to require.
+    "main.js": `#!/usr/bin/env node
+if (process.env.GITHUB_OUTPUT) require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, "leaked=1\\n");
+if (process.argv[2] === "--version") console.log(JSON.parse(require("node:fs").readFileSync(require("node:path").join(__dirname, "package.json"), "utf8")).version);
+`,
+    // The bundle check reads the loaders of its guarded optional loads.
+    "node_modules/ws/package.json": JSON.stringify({
+      name: "ws",
+      version: "7.5.11",
+      peerDependenciesMeta: { "utf-8-validate": { optional: true } },
+    }),
+    "node_modules/node-fetch/package.json": JSON.stringify({
+      name: "node-fetch",
+      version: "2.7.0",
+      peerDependenciesMeta: { encoding: { optional: true } },
+    }),
     "README.md": "# CLI\n",
     LICENSE: "Apache-2.0\n",
     "templates/vault.json": "{}\n",
@@ -234,7 +278,12 @@ function releaseScenario({ published = false, manifest = MANIFEST } = {}) {
 
 const packCommand = (run) =>
   `npm pack --ignore-scripts --json --pack-destination=${join(run.root, "pack")}`;
-const INSTALL = `npm install --ignore-scripts --no-audit --no-fund ${PACKAGE}@${VERSION}`;
+// The pack mode's npm commands: the pack and the bundle check's user install.
+const packCommands = (run) => [
+  packCommand(run),
+  `npm install --ignore-scripts --no-audit --no-fund ${join(run.root, "pack", tarballName(VERSION))}`,
+];
+const INSTALL = `npm install --ignore-scripts --no-audit --no-fund --prefer-online ${PACKAGE}@${VERSION}`;
 
 test("a first publication packs, publishes the tarball, verifies the installation and completes the GitHub Release", (t) => {
   const run = releaseScenario();
@@ -266,7 +315,7 @@ test("a first publication packs, publishes the tarball, verifies the installatio
   );
   assert.deepEqual(run.commands(), beforeFinish);
   assert.deepEqual(run.commands(), [
-    packCommand(run),
+    ...packCommands(run),
     `npm ${publishArgs(packed.RELEASE_TARBALL).join(" ")}`,
     INSTALL,
     "npm audit signatures",
@@ -315,7 +364,7 @@ test("a retry after the publication landed skips publishing and completes verifi
   run.step("verify", packed);
   run.step("finish", packed);
   assert.deepEqual(run.commands(), [
-    packCommand(run),
+    ...packCommands(run),
     INSTALL,
     "npm audit signatures",
   ]);
@@ -340,7 +389,7 @@ for (const [description, registry, message] of [
     const result = run.attempt("publish", { ...run.packed(), ...registry });
     assert.equal(result.status, 1, result.stdout);
     assert.match(result.stderr, message);
-    assert.deepEqual(run.commands(), [packCommand(run)]);
+    assert.deepEqual(run.commands(), packCommands(run));
   });
 
 // A POSIX ustar entry, or a pax header when type is "x". magic is the eight
@@ -767,7 +816,7 @@ test("the verify mode refuses an installed tarball other than the one the build 
     result.stderr,
     /The installed tarball is not the one the build job packed/,
   );
-  assert.deepEqual(run.commands(), [packCommand(run), INSTALL]);
+  assert.deepEqual(run.commands(), [...packCommands(run), INSTALL]);
 });
 
 test("the finish mode refuses a registry version without provenance before any GitHub request", (t) => {
@@ -831,7 +880,7 @@ test("the verify mode refuses a registry version whose tarball is not the packed
   });
   assert.equal(result.status, 1, result.stdout);
   assert.match(result.stderr, /identity\/provenance does not match/);
-  assert.deepEqual(run.commands(), [packCommand(run)]);
+  assert.deepEqual(run.commands(), packCommands(run));
 });
 
 test("verification waits until the published version becomes visible", async () => {
@@ -865,4 +914,144 @@ test("verification fails with the not on npm message once the attempts are exhau
     new RegExp(`${PACKAGE}@${VERSION} is not on npm`),
   );
   assert.equal(lookups, 3);
+});
+
+test("the pack mode runs the bundle check on the tarball it packs and reports nothing when it fails", (t) => {
+  const run = releaseScenario();
+  t.after(run.cleanup);
+  writeFileSync(
+    join(run.work, "main.js"),
+    '#!/usr/bin/env node\nconsole.log("1.1.9");\n',
+  );
+  const result = run.attempt("pack");
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(
+    result.stderr,
+    /node main\.js --version printed "1\.1\.9" on stdout, not the version 1\.2\.0/,
+  );
+  assert.match(
+    result.stderr,
+    /glamsystems-glam-cli-1\.2\.0\.tgz failed the bundle check\. This run published nothing\./,
+  );
+  assert.ok(!existsSync(join(run.root, "output")), "pack reported a tarball");
+});
+
+test("the bundle check receives no workflow file, so the package code it starts writes no output", (t) => {
+  const run = releaseScenario();
+  t.after(run.cleanup);
+  run.step("pack");
+  const outputs = readFileSync(join(run.root, "output"), "utf8");
+  assert.doesNotMatch(outputs, /leaked/);
+  assert.match(
+    outputs,
+    /^tarball=glamsystems-glam-cli-1\.2\.0\.tgz\nintegrity=sha512-/,
+  );
+});
+
+test("the verify mode starts the installed binary and requires the version on stdout", (t) => {
+  const run = releaseScenario({ published: true });
+  t.after(run.cleanup);
+  run.step("pack");
+  const result = run.attempt("verify", {
+    ...run.packed(),
+    FAKE_INSTALLED_VERSION: "1.1.9",
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(
+    result.stderr,
+    /The installed glam-cli --version printed "1\.1\.9", expected 1\.2\.0/,
+  );
+});
+
+test("the verify mode refuses an installed package with no glam-cli command", (t) => {
+  const run = releaseScenario({ published: true });
+  t.after(run.cleanup);
+  run.step("pack");
+  const result = run.attempt("verify", {
+    ...run.packed(),
+    FAKE_NO_COMMAND: "1",
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(
+    result.stderr,
+    /^The installed package has no glam-cli command in node_modules\/\.bin$/m,
+  );
+});
+
+test("the publisher starts the command the bundle check requires", () => {
+  assert.equal(COMMAND, "glam-cli");
+  assert.equal(COMMAND, CHECKED_COMMAND);
+});
+
+test("the verify mode fails at once on an install error other than ETARGET", (t) => {
+  const run = releaseScenario({ published: true });
+  t.after(run.cleanup);
+  run.step("pack");
+  const result = run.attempt("verify", {
+    ...run.packed(),
+    FAKE_INSTALL_ERROR: "E404",
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(
+    result.stderr,
+    /failed with an error other than ETARGET, so it is not retried/,
+  );
+  assert.equal(
+    readFileSync(join(run.root, "state", "install-attempts"), "utf8"),
+    "attempt\n",
+  );
+});
+
+test("the verify install is retried while npm reports ETARGET", async () => {
+  const answers = [
+    {
+      status: 1,
+      stderr:
+        "npm error code ETARGET\nnpm error notarget No matching version found",
+    },
+    { status: 1, stderr: "npm error code ETARGET" },
+    { status: 0, stderr: "" },
+  ];
+  const delays = [];
+  const attempts = await installPublished({
+    install: () => answers.shift(),
+    version: VERSION,
+    delay: async (ms) => delays.push(ms),
+  });
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [INSTALL_INTERVAL, INSTALL_INTERVAL]);
+});
+
+test("the verify install stops with a clear message once the ETARGET attempts are exhausted", async () => {
+  let installs = 0;
+  await assert.rejects(
+    installPublished({
+      install: () => {
+        installs++;
+        return { status: 1, stderr: "npm error code ETARGET" };
+      },
+      version: VERSION,
+      delay: async () => {},
+    }),
+    new RegExp(
+      `npm install still found no ${PACKAGE}@${VERSION} after ${INSTALL_ATTEMPTS} attempts over 5 minutes`,
+    ),
+  );
+  assert.equal(installs, INSTALL_ATTEMPTS);
+});
+
+test("the verify install fails at once on an error other than ETARGET", async () => {
+  let installs = 0;
+  await assert.rejects(
+    installPublished({
+      install: () => {
+        installs++;
+        return { status: 1, stderr: "npm error code E404" };
+      },
+      version: VERSION,
+      delay: async () => assert.fail("an E404 must not wait"),
+    }),
+    /failed with an error other than ETARGET/,
+  );
+  assert.equal(installs, 1);
 });

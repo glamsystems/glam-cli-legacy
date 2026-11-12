@@ -18,6 +18,9 @@ them in `.github/release-companion.json`.
   leaves a publish job that passed at its earlier attempt.
 - `scripts/release-cli.mjs` holds the modes the workflow runs: `validate`,
   `pack`, `publish`, `verify` and `finish`.
+- `scripts/check-bundle.mjs` is the bundle check. The pack mode runs it on the
+  tarball it packs, and the private controller runs it in the release
+  snapshot and on every pull request that changes the CLI.
 
 The controller reads `.cli-release.json` (version, private source commit,
 notes) from the tagged commit and expects the GitHub Release body to end with
@@ -88,7 +91,68 @@ in this order:
    build job added, such as `publishConfig`, fails, and so does a file that
    makes npm add a field, such as a `binding.gyp`.
 
-The pack mode runs the same checks on the tarball it packed. Every mode also
+The pack mode runs the same checks on the tarball it packed, and then the
+bundle check on that tarball. The bundle check refuses unless all of these
+hold:
+
+1. `package.json`'s `bin` is the one command `glam-cli`, started from `main.js`
+   or `./main.js`. `main.js` starts with `#!/usr/bin/env node`, and
+   `node main.js --version` exits 0 and prints exactly the version in
+   `package.json` on stdout. A warning on stderr does not count.
+2. `main.js` is searched as text, not as syntax. The search sees each place
+   where the word `require` or `import`, with any text before it, is followed by
+   optional space, an optional `?.` and an opening parenthesis. Text in a string
+   or a comment counts like code. Each place is one of three kinds. A literal is
+   a place followed by optional space, a quote, a module name, the same quote,
+   optional space and a closing parenthesis. A module name is one or more ASCII
+   letters, digits and the characters `@ / . _ : -`, so no place stands inside a
+   literal.
+   Another string is a place followed by optional space and a quote that does
+   not start a literal, and it is refused for both words. Every other place is
+   computed. A computed `require(` is refused, and a computed `import(` passes,
+   because the bundle has one. Each literal names a Node builtin, a key of
+   `dependencies` or `optionalDependencies`, or a guarded optional load. A
+   guarded optional load is named in the check's list with its reason and the
+   package that loads it inside try/catch, and every installed copy of that
+   package marks it `optional: true` in `peerDependenciesMeta`. Today the list
+   is `utf-8-validate`, which `ws` loads, and `encoding`, which `node-fetch`
+   loads. A path or a URL is refused, because the published package holds
+   `main.js` and no such file. A literal is refused when a segment between its
+   slashes is only dots, or is `node_modules` in any case with or without dots
+   after it, since such a segment can leave the package the literal names and
+   load a package that `package.json` does not declare. A plain subpath still
+   counts as its package.
+3. The tarball, installed with `--ignore-scripts` into a fresh project in a
+   temporary folder, gives the command `glam-cli` in `node_modules/.bin`. The
+   command starts with `--version` from a folder with no `cli/` subfolder and
+   prints the version. Each declared package from the search and each key of
+   `optionalDependencies` resolves from the installed package to the same
+   package name and version as from the checkout, or is absent in both. The
+   name is the one in the resolved `package.json`, so an alias counts by its
+   real package.
+
+The pack mode starts the check with only `PATH`, `HOME`, `TMPDIR` and npm's
+own settings in its environment. The package code the check starts therefore
+does not get the path of the step's output file or of any other workflow
+file. The check writes nothing in the checkout.
+
+The search sees only those places. These are examples, not a full list. It does
+not see `require` or `import` held in another name or called through `call`,
+`apply` or `bind`, a module loaded through `createRequire`, what an `import(`
+that is not followed by a quote loads, or a call written with an escape in its
+name or a comment before its parenthesis. The optional dependencies are compared
+because the build loads them through a `createRequire` wrapper.
+
+When the bundle check refuses, the job reports no tarball and nothing is
+published. A rerun at the same tag refuses the same way, because the tag
+freezes the source, the lockfile and `package.json`. The release cannot
+complete at this tag. For a fault in what the bundle loads, correct the CLI in
+the monorepo, for example by declaring the package the bundle loads. A fault
+in `bin` is in this repository's own `package.json`, whose `bin` the sync
+keeps as it is, so a change to the CLI in the monorepo does not correct it. In
+both cases decide the recovery of this release in the monorepo.
+
+Every mode also
 refuses a `package.json` that carries a `publishConfig` other than
 `{ "access": "public" }`, which the mirror has always carried. Only a registry
 HTTP 404 permits a publish, which runs from an empty directory:
@@ -106,9 +170,14 @@ registry, so the command sets both.
 An existing version is accepted only when its `gitHead` is this commit and its
 integrity equals the tarball's. The verify job waits for the version and checks
 its identity, signature and provenance. It installs the version with
-`--ignore-scripts`, requires the installed tarball's integrity to equal the
-reported one, runs `npm audit signatures` and loads the installed version. The finish job runs no
-npm. It checks the registry identity through `fetch` and then completes the
+`--ignore-scripts` and `--prefer-online`. npm's package index can lag the
+version endpoint by minutes. So while the install fails with `ETARGET`, the job
+tries again every 15 seconds, 20 times in all, and then stops and says so. Any
+other install error ends the job at once. The installed tarball's integrity
+must equal the reported one. The job then runs `npm audit signatures`, loads
+the installed version and starts the installed `glam-cli --version`, which
+must print the version on stdout. The finish job
+runs no npm. It checks the registry identity through `fetch` and then completes the
 GitHub Release.
 
 The build job's dependencies can change the files they build. They hold the
@@ -138,9 +207,18 @@ differs cannot complete at this tag. The published version then stays as it is
 on npm. Find what changed the build, then approve a new patch version in the
 monorepo and release that.
 
-The tests in `scripts/tests/release-cli.test.mjs` run with the Node version in
+The tests in `scripts/tests/release-cli.test.mjs` and
+`scripts/tests/check-bundle.test.mjs` run with the Node version in
 `.node-version` and load npm's own modules from the npm bundled with it:
 
 ```bash
-node --test scripts/tests/release-cli.test.mjs
+node --test scripts/tests/release-cli.test.mjs scripts/tests/check-bundle.test.mjs
+```
+
+To run the bundle check by hand, run it from the repository root after
+`npm ci --ignore-scripts` and `npm run build`. It needs the registry for the
+user install:
+
+```bash
+node scripts/check-bundle.mjs
 ```

@@ -4,7 +4,9 @@
     ".github/CLI_RELEASES.md",
     ".github/workflows/publish.yml",
     ".node-version",
+    "scripts/check-bundle.mjs",
     "scripts/release-cli.mjs",
+    "scripts/tests/check-bundle.test.mjs",
     "scripts/tests/release-cli.test.mjs"
   ]
 }

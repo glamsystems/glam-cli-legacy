@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -21,7 +22,7 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { gunzipSync } from "node:zlib";
 
@@ -29,6 +30,9 @@ import { gunzipSync } from "node:zlib";
 // The private controller created the tag and .cli-release.json; this script
 // packs, publishes, verifies, and completes the public GitHub Release.
 const PACKAGE = "@glamsystems/glam-cli";
+// The command the verify job starts. scripts/check-bundle.mjs holds the same
+// name, and a test keeps the two equal.
+export const COMMAND = "glam-cli";
 const MARKER = ".cli-release.json";
 const PROOF = "cli-release";
 const REGISTRY = "https://registry.npmjs.org";
@@ -47,6 +51,13 @@ const LIFECYCLE = [
   "postpublish",
 ];
 const RUN_BY_THE_BUILD_JOB = { prepack: "npm run build" };
+const BUNDLE_CHECK = fileURLToPath(
+  new URL("./check-bundle.mjs", import.meta.url),
+);
+// The verify job retries an install that finds no matching version for this
+// long: npm's package index can lag the version endpoint by minutes.
+export const INSTALL_ATTEMPTS = 20;
+export const INSTALL_INTERVAL = 15_000;
 
 // execFileSync returns null when stdout is not piped (stdio: "inherit").
 const run = (cmd, args, options = {}) =>
@@ -373,6 +384,28 @@ function validate() {
     fail(`Tag ${tag} resolves to ${tagged}, not the checked-out ${head}`);
 }
 
+// Starts the build and installs the packed tarball as a user would, and
+// refuses a tarball whose user install loads other packages than this tree.
+// The check runs package code, so its environment carries only what npm and
+// node need: no GITHUB_OUTPUT and no other workflow file.
+function checkBundle(tarball) {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) =>
+        ["PATH", "HOME", "TMPDIR"].includes(name) ||
+        name.startsWith("npm_config_"),
+    ),
+  );
+  const result = spawnSync(process.execPath, [BUNDLE_CHECK, tarball], {
+    env,
+    stdio: "inherit",
+  });
+  if (result.status !== 0)
+    fail(
+      `${basename(tarball)} failed the bundle check. This run published nothing.`,
+    );
+}
+
 // The build job, after npm ci and npm run build. npm reads gitHead from the
 // folder's git HEAD when it publishes a directory, and from package.json when
 // it publishes a tarball.
@@ -418,6 +451,7 @@ async function pack() {
     join(destination, "release-pack.json"),
     `${JSON.stringify(packed, null, 2)}\n`,
   );
+  checkBundle(join(destination, name));
   appendFileSync(
     process.env.GITHUB_OUTPUT,
     `tarball=${name}\nintegrity=${integrity}\n`,
@@ -504,6 +538,34 @@ async function published(pkg, head, integrity) {
   return metadata;
 }
 
+// Installs the published version, again while npm reports ETARGET: the
+// version endpoint can show a publish minutes before the package index that
+// npm install reads. Any other failure ends at once.
+export async function installPublished({
+  install,
+  version,
+  delay = sleep,
+  attempts = INSTALL_ATTEMPTS,
+  interval = INSTALL_INTERVAL,
+}) {
+  for (let attempt = 1; ; attempt++) {
+    const { status, stderr } = install();
+    if (status === 0) return attempt;
+    if (!/\bETARGET\b/.test(stderr ?? ""))
+      throw new Error(
+        `npm install ${PACKAGE}@${version} failed with an error other than ETARGET, so it is not retried. Read the npm output above.`,
+      );
+    if (attempt === attempts)
+      throw new Error(
+        `npm install still found no ${PACKAGE}@${version} after ${attempts} attempts over ${Math.round(((attempts - 1) * interval) / 60_000)} minutes, though the registry's version endpoint lists it. Run the verify job again once npm view ${PACKAGE}@${version} prints the version.`,
+      );
+    console.error(
+      `npm install found no ${PACKAGE}@${version} yet (ETARGET). Attempt ${attempt} of ${attempts}, retrying in ${interval / 1000} seconds.`,
+    );
+    await delay(interval);
+  }
+}
+
 // The verify job, with read access only: it installs and loads the package.
 async function verify() {
   const { pkg, head } = context();
@@ -514,20 +576,29 @@ async function verify() {
     join(sandbox, "package.json"),
     JSON.stringify({ name: "verify", private: true }),
   );
-  run(
-    "npm",
-    [
-      "install",
-      "--ignore-scripts",
-      "--no-audit",
-      "--no-fund",
-      `${PACKAGE}@${pkg.version}`,
-    ],
-    {
-      cwd: sandbox,
-      stdio: "inherit",
+  await installPublished({
+    version: pkg.version,
+    install: () => {
+      const result = spawnSync(
+        "npm",
+        [
+          "install",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
+          "--prefer-online",
+          `${PACKAGE}@${pkg.version}`,
+        ],
+        {
+          cwd: sandbox,
+          encoding: "utf8",
+          stdio: ["ignore", "inherit", "pipe"],
+        },
+      );
+      process.stderr.write(result.stderr ?? "");
+      return result;
     },
-  );
+  }).catch((error) => fail(error.message));
   const lock = JSON.parse(
     readFileSync(join(sandbox, "package-lock.json"), "utf8"),
   );
@@ -543,6 +614,26 @@ async function verify() {
   );
   if (installed !== pkg.version)
     fail(`Installed ${installed}, expected ${pkg.version}`);
+  // The installed command, started as a user starts it, from a folder with no
+  // cli/ subfolder. stderr may carry a warning, so only stdout is compared.
+  const command = join(sandbox, "node_modules", ".bin", COMMAND);
+  if (!existsSync(command))
+    fail(
+      `The installed package has no ${COMMAND} command in node_modules/.bin`,
+    );
+  const started = spawnSync(command, ["--version"], {
+    cwd: sandbox,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  if (started.status !== 0)
+    fail(
+      `The installed ${COMMAND} --version exited ${started.status ?? started.error?.message}`,
+    );
+  if (started.stdout.trim() !== pkg.version)
+    fail(
+      `The installed ${COMMAND} --version printed ${JSON.stringify(started.stdout.trim())}, expected ${pkg.version}`,
+    );
 }
 
 // The finish job. It checks the registry through fetch and runs no npm.
