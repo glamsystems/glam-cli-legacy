@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "package": "@glamsystems/glam-cli",
+  "version": "1.2.3",
+  "source": {
+    "repository": "glamsystems/glam",
+    "commit": "afd68cfcb62c7d3b75748159328c1a5c68575a5e"
+  },
+  "notes": "### Bug Fixes\n\n* **runtime:** apply November Node security releases ([#1763](https://github.com/glamsystems/glam/issues/1763)) ([93832b0](https://github.com/glamsystems/glam/commit/93832b0828c0144984357520eaca98af1d00ea4f))"
+}
