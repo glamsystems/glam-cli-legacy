@@ -1,14 +1,72 @@
 import { type Command } from "commander";
 import { type CliContext, executeTxWithErrorHandling } from "../utils";
+import { fail } from "../errors";
 import {
   parseNonNegativeInteger,
   parsePositiveInteger,
   parsePositiveUiAmount,
+  parseU32,
 } from "../parsing";
 import { BN } from "@coral-xyz/anchor";
-import { CctpPolicy, publicKeyToEvmAddress } from "@glamsystems/glam-sdk";
-import { evmAddressToPublicKey } from "@glamsystems/glam-sdk";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import {
+  bytesToHex,
+  CCTP_PROTOCOL,
+  CctpPolicy,
+  evmAddressToPublicKey,
+  publicKeyToEvmAddress,
+} from "@glamsystems/glam-sdk";
 import { PublicKey } from "@solana/web3.js";
+
+/**
+ * The 32 bytes a CCTP destination is sent or stored as: a base58 key with
+ * --base58, else 40 hexadecimal digits, an EVM address padded to 32 bytes,
+ * or 64, the recipient's own 32 bytes. Read before the confirmation, which
+ * shows them.
+ */
+function parseDestination(value: string, base58?: boolean): PublicKey {
+  const address = value.trim();
+  try {
+    return base58 ? new PublicKey(address) : evmAddressToPublicKey(address);
+  } catch (error) {
+    fail(
+      base58
+        ? `destination-address ${address} is not a base58 public key`
+        : (error as Error).message,
+    );
+  }
+}
+
+/** The CCTP policy an edit replaces: the staged one under a timelock that holds one. */
+async function cctpPolicyToEdit(context: CliContext, timelock: VaultTimelock) {
+  return timelock.policy(
+    () => context.glamClient.cctp.fetchPolicy(),
+    () => context.glamClient.extCctpProgram.programId,
+    CCTP_PROTOCOL,
+    CctpPolicy.decode,
+  );
+}
+
+function encodedDestination(destination: PublicKey): string {
+  return `0x${bytesToHex(destination.toBytes())}`;
+}
+
+/**
+ * A stored destination as it reads: an EVM address where its first 12 bytes
+ * are zero, and all 32 bytes otherwise, which the address's 20 would cut.
+ */
+function shownDestination(destination: PublicKey): string {
+  return destination
+    .toBytes()
+    .subarray(0, 12)
+    .every((byte) => byte === 0)
+    ? publicKeyToEvmAddress(destination)
+    : encodedDestination(destination);
+}
 
 export function installCctpCommands(program: Command, context: CliContext) {
   program
@@ -23,7 +81,7 @@ export function installCctpCommands(program: Command, context: CliContext) {
       console.log("CCTP allowed destinations:");
       for (const destination of cctpPolicy.allowedDestinations) {
         console.log(
-          `\t${destination.domain}: ${publicKeyToEvmAddress(destination.address)}`,
+          `\t${destination.domain}: ${shownDestination(destination.address)}`,
         );
       }
     });
@@ -31,26 +89,25 @@ export function installCctpCommands(program: Command, context: CliContext) {
   program
     .command("allowlist-destination")
     .argument("<domain>", "CCTP domain", (value: string) =>
-      parseNonNegativeInteger(value, "domain"),
+      parseU32(value, "domain"),
     )
     .argument("<destination-address>", "Destination address")
     .option("--base58", "Address is a base58 string")
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a destination to the allowlist")
     .action(async (domain, destinationAddress, { base58, yes }) => {
-      const destinationPubkey = base58
-        ? new PublicKey(destinationAddress)
-        : evmAddressToPublicKey(destinationAddress);
+      const destinationPubkey = parseDestination(destinationAddress, base58);
 
-      const cctpPolicy =
-        (await context.glamClient.cctp.fetchPolicy()) ?? new CctpPolicy([]);
+      const timelock = await readVaultTimelock(context);
+      const base = await cctpPolicyToEdit(context, timelock);
+      const cctpPolicy = base.value ?? new CctpPolicy([]);
       if (
         cctpPolicy.allowedDestinations.find(
           (d) => d.domain === domain && d.address.equals(destinationPubkey),
         )
       ) {
         console.error(
-          `Destination address ${destinationAddress} is already in the allowlist`,
+          `Destination address ${destinationAddress} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
         );
         process.exit(1);
       }
@@ -63,43 +120,67 @@ export function installCctpCommands(program: Command, context: CliContext) {
         () => context.glamClient.cctp.setPolicy(cctpPolicy, context.txOptions),
         {
           skip: yes,
-          message: `Confirm adding destination ${destinationAddress} (domain ${domain}) to allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding destination ${destinationAddress} (domain ${domain}, stored as ${encodedDestination(destinationPubkey)}) to allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the CCTP allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Destination ${destinationAddress} (domain ${domain}) added to allowlist: ${txSig}`,
+        timelock.outcome(
+          `Destination ${destinationAddress} (domain ${domain}) added to allowlist`,
+        ),
       );
     });
 
   program
     .command("remove-destination")
     .argument("<domain>", "CCTP domain", (value: string) =>
-      parseNonNegativeInteger(value, "domain"),
+      parseU32(value, "domain"),
     )
     .argument("<destination-address>", "Destination address")
     .option("--base58", "Address is a base58 string")
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove a destination from the allowlist")
     .action(async (domain, destinationAddress, { base58, yes }) => {
-      const destinationPubkey = base58
-        ? new PublicKey(destinationAddress)
-        : evmAddressToPublicKey(destinationAddress);
+      const destinationPubkey = parseDestination(destinationAddress, base58);
 
-      const cctpPolicy = await context.glamClient.cctp.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await cctpPolicyToEdit(context, timelock);
+      const cctpPolicy = base.value;
       if (!cctpPolicy) {
-        console.error(`CCTP policy not found`);
+        console.error(
+          `CCTP policy not found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
-      cctpPolicy.allowedDestinations = cctpPolicy.allowedDestinations.filter(
+      const kept = cctpPolicy.allowedDestinations.filter(
         (d) => !(d.domain === domain && d.address.equals(destinationPubkey)),
       );
+      if (kept.length === cctpPolicy.allowedDestinations.length) {
+        fail(
+          `Destination ${destinationAddress} (domain ${domain}) is not in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
+      }
+      cctpPolicy.allowedDestinations = kept;
       await executeTxWithErrorHandling(
         () => context.glamClient.cctp.setPolicy(cctpPolicy, context.txOptions),
         {
           skip: yes,
-          message: `Confirm removing destination ${destinationAddress} (domain ${domain}) from allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing destination ${destinationAddress} (domain ${domain}, stored as ${encodedDestination(destinationPubkey)}) from allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the CCTP allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Destination ${destinationAddress} (domain ${domain}) removed from allowlist: ${txSig}`,
+        timelock.outcome(
+          `Destination ${destinationAddress} (domain ${domain}) removed from allowlist`,
+        ),
       );
     });
 
@@ -108,7 +189,7 @@ export function installCctpCommands(program: Command, context: CliContext) {
     .command("bridge-usdc")
     .argument("<amount>", "USDC amount in UI units")
     .argument("<domain>", "CCTP domain", (value: string) =>
-      parseNonNegativeInteger(value, "domain"),
+      parseU32(value, "domain"),
     )
     .argument("<destination-address>", "Recipient EVM address")
     .option(
@@ -134,9 +215,7 @@ export function installCctpCommands(program: Command, context: CliContext) {
         destinationAddress,
         { maxFeeBps, base58, fast, yes },
       ) => {
-        const destinationPubkey = base58
-          ? new PublicKey(destinationAddress)
-          : evmAddressToPublicKey(destinationAddress);
+        const destinationPubkey = parseDestination(destinationAddress, base58);
         const cctpPolicy = await context.glamClient.cctp.fetchPolicy();
         if (
           cctpPolicy &&
@@ -169,7 +248,8 @@ export function installCctpCommands(program: Command, context: CliContext) {
             ),
           {
             skip: yes,
-            message: `Confirm bridging ${amount} USDC to ${destinationAddress} (domain ${domain})`,
+            // The fee bound that is sent is the floored amount, not the rate.
+            message: `Confirm bridging ${amount} USDC to ${destinationAddress} (domain ${domain}, mint recipient ${encodedDestination(destinationPubkey)}, max fee ${maxFee.toString()} base units at ${maxFeeBps} bps, finality threshold ${minFinalityThreshold})`,
           },
           (txSig) => `USDC burned: ${txSig}`,
         );
@@ -179,7 +259,7 @@ export function installCctpCommands(program: Command, context: CliContext) {
   program
     .command("receive")
     .argument("<source-domain>", "Source domain", (value: string) =>
-      parseNonNegativeInteger(value, "source-domain"),
+      parseU32(value, "source-domain"),
     )
     .option(
       "-t, --tx-hash <tx-hash>",
@@ -190,6 +270,12 @@ export function installCctpCommands(program: Command, context: CliContext) {
       "Receive USDC from an EVM chain. Either txHash or nonce is required.",
     )
     .action(async (sourceDomain, { txHash, nonce }) => {
+      // The SDK looks the message up by the nonce when it has one, and by
+      // the hash otherwise, so one of two would be dropped.
+      if (txHash && nonce) {
+        fail("Give --tx-hash or --nonce, not both");
+      }
+
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.cctp.receiveUsdc(

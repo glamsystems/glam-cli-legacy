@@ -1,6 +1,7 @@
 import { BN } from "@coral-xyz/anchor";
 import {
   LoopscaleLoan,
+  type LoopscaleLoanDuration,
   LoopscaleBorrowMarketPolicy,
   LoopscaleBorrowPolicy,
   LoopscaleLendingMarketPolicy,
@@ -28,6 +29,11 @@ import {
   resolveTokenMint,
   resolveTokenPublicKey,
 } from "../utils";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
 import { fail } from "../errors";
 import {
   parseBps,
@@ -37,8 +43,142 @@ import {
   parsePositiveUiAmount,
   parseU8,
   parseUnsignedNumber,
+  requireSafeIntegerAmount,
   validatePublicKey,
 } from "../parsing";
+
+// Loopscale's duration types, by their number.
+const LOOPSCALE_DURATION_UNITS = ["day", "week", "month", "minute", "year"];
+
+function formatLoopscaleDuration(term: LoopscaleLoanDuration): string {
+  const unit = LOOPSCALE_DURATION_UNITS[term.durationType];
+  return unit === undefined
+    ? `duration ${term.duration} of type ${term.durationType}`
+    : `${term.duration} ${unit}${term.duration === 1 ? "" : "s"}`;
+}
+
+// The term of each Loopscale duration index, as the --durations help gives it.
+const DURATION_TERMS = ["1 day", "1 week", "1 month", "3 months", "1 year"];
+
+function durationsText(indexes: number[]): string {
+  return indexes.length === 0
+    ? "none, which denies every duration"
+    : indexes
+        .map(
+          (index) => `${DURATION_TERMS[index] ?? `index ${index}`} (${index})`,
+        )
+        .join(", ");
+}
+
+/** A list a policy stores, and what the program makes of an empty one. */
+export function keysText(keys: PublicKey[], emptyDenies: string): string {
+  return keys.length === 0
+    ? `none, which denies ${emptyDenies}`
+    : keys.map((key) => key.toBase58()).join(", ");
+}
+
+function limitText(value: BN | number, unit: string, zeroDenies: string) {
+  const zero = typeof value === "number" ? value === 0 : value.isZero();
+  return `${value.toString()} ${unit}${zero ? `, which denies ${zeroDenies}` : ""}`;
+}
+
+type PolicyField = [label: string, value: string];
+
+/** Each limit a lending market policy stores, as ext_loopscale reads it. */
+export function lendingMarketFields(
+  policy: LoopscaleLendingMarketPolicy,
+): PolicyField[] {
+  return [
+    [
+      "max deposit per instruction",
+      limitText(
+        policy.maxDepositAmount,
+        "base units",
+        "every deposit in this market",
+      ),
+    ],
+    [
+      "max exposure per strategy",
+      limitText(
+        policy.maxTotalDepositAmount,
+        "base units",
+        "all lending in this market",
+      ),
+    ],
+    ["min loan APY", `${policy.minLoanApyCbps} cBPS`],
+    [
+      "max borrower LTV",
+      limitText(policy.maxLtvBps, "bps", "every borrower LTV"),
+    ],
+    ["durations", durationsText(policy.durationIndexesAllowlist)],
+    [
+      "collateral assets",
+      keysText(policy.collateralAssetAllowlist, "every collateral asset"),
+    ],
+  ];
+}
+
+/** Each limit a borrow market policy stores, as ext_loopscale reads it. */
+export function borrowMarketFields(
+  policy: LoopscaleBorrowMarketPolicy,
+): PolicyField[] {
+  return [
+    [
+      "max borrow per instruction",
+      limitText(
+        policy.maxBorrowAmount,
+        "base units",
+        "every borrow in this market",
+      ),
+    ],
+    [
+      "max outstanding principal per loan",
+      limitText(
+        policy.maxTotalBorrowAmount,
+        "base units",
+        "all borrowing in this market",
+      ),
+    ],
+    [
+      "max expected liquidation LTV",
+      limitText(policy.maxLtvBps, "bps", "every expected liquidation LTV"),
+    ],
+    ["durations", durationsText(policy.durationIndexesAllowlist)],
+  ];
+}
+
+/** The limits a market policy writes, each against the stored one an update replaces. */
+export function marketFieldLines(
+  next: PolicyField[],
+  previous?: PolicyField[],
+): string[] {
+  return next.map(([label, value], index) => {
+    const before = previous?.[index]?.[1];
+    return before !== undefined && before !== value
+      ? `  ${label}: ${before} -> ${value}`
+      : `  ${label}: ${value}`;
+  });
+}
+
+/**
+ * The collateral terms a strategy command sends, one line each: the
+ * market's asset at the collateral index, the term and the APY.
+ */
+export function collateralTermLines(
+  marketInfo: LoopscaleMarketInformation,
+  terms: LoopscaleMultiCollateralTermsUpdateParams[],
+): string[] {
+  return terms.flatMap(({ apy, indices }) =>
+    indices.map(
+      ({ collateralIndex, durationIndex }) =>
+        `collateral term: ${marketInfo.assetData[collateralIndex]?.assetIdentifier ?? "unknown asset"} (index ${collateralIndex}) for ${DURATION_TERMS[durationIndex] ?? `duration ${durationIndex}`} at ${apy.toString()} cBPS`,
+    ),
+  );
+}
+
+// ext_loopscale governs a market with no market policy by the allowlists alone.
+export const MARKET_LIMITS_CLEARED =
+  "  per-market limits: none. Limits stored for any market are removed, and those markets fall back to the allowlists above.";
 
 function formatPolicyDecodeError(error: unknown): string {
   if (error instanceof Error) {
@@ -438,6 +578,19 @@ export async function parseCollateralTermUpdates(
   return [...groups.values()];
 }
 
+/** The Loopscale borrow policy an edit replaces: the staged one under a timelock that holds one. */
+async function loopscaleBorrowPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.loopscaleBorrow.fetchPolicy(),
+    () => context.glamClient.loopscaleBorrow.programId,
+    LOOPSCALE_BORROW_PROTOCOL,
+    LoopscaleBorrowPolicy.decode,
+  );
+}
+
 export function installLoopscaleBorrowCommands(
   loopscaleBorrow: Command,
   context: CliContext,
@@ -567,6 +720,7 @@ export function installLoopscaleBorrowCommands(
         [],
       );
 
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.loopscaleBorrow.setPolicy(
@@ -575,9 +729,16 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: "Confirm replacing Loopscale borrow policy",
+          message: timelock.confirm(
+            [
+              "Confirm replacing Loopscale borrow policy",
+              `  collateral allowlist: ${keysText(collateralAllowlist, "every collateral deposit")}`,
+              `  principal allowlist: ${keysText(principalAllowlist, "every principal borrow")}`,
+              MARKET_LIMITS_CLEARED,
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Loopscale borrow policy replaced: ${txSig}`,
+        timelock.outcome("Loopscale borrow policy replaced"),
       );
     });
 
@@ -588,6 +749,7 @@ export function installLoopscaleBorrowCommands(
       "Reset Loopscale borrow policy to an empty default without decoding the existing policy",
     )
     .action(async (options) => {
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.loopscaleBorrow.setPolicy(
@@ -596,9 +758,11 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: "Confirm resetting Loopscale borrow policy",
+          message: timelock.confirm(
+            "Confirm resetting Loopscale borrow policy",
+          ),
         },
-        (txSig) => `Loopscale borrow policy reset: ${txSig}`,
+        timelock.outcome("Loopscale borrow policy reset"),
       );
     });
 
@@ -609,11 +773,13 @@ export function installLoopscaleBorrowCommands(
     .description("Add a principal token to the borrow allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.loopscaleBorrow.fetchPolicy()) ??
-        new LoopscaleBorrowPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleBorrowPolicy();
       if (policy.principalAllowlist.find((m) => m.equals(token))) {
-        fail(`Principal token ${token} is already in the allowlist`);
+        fail(
+          `Principal token ${token} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.principalAllowlist.push(token);
@@ -625,9 +791,16 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm adding principal token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding principal token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Principal token ${token} added to allowlist: ${txSig}`,
+        timelock.outcome(`Principal token ${token} added to allowlist`),
       );
     });
 
@@ -638,12 +811,18 @@ export function installLoopscaleBorrowCommands(
     .description("Remove a principal token from the borrow allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.loopscaleBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No borrow policy found");
+        fail(
+          `No borrow policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.principalAllowlist.find((m) => m.equals(token))) {
-        fail("Principal token not in allowlist. Removal not needed.");
+        fail(
+          `Principal token not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
       policy.principalAllowlist = policy.principalAllowlist.filter(
@@ -657,9 +836,16 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm removing principal token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing principal token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Principal token ${token} removed from allowlist: ${txSig}`,
+        timelock.outcome(`Principal token ${token} removed from allowlist`),
       );
     });
 
@@ -670,11 +856,13 @@ export function installLoopscaleBorrowCommands(
     .description("Add a collateral token to the allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.loopscaleBorrow.fetchPolicy()) ??
-        new LoopscaleBorrowPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleBorrowPolicy();
       if (policy.collateralAllowlist.find((m) => m.equals(token))) {
-        fail(`Collateral token ${token} is already in the allowlist`);
+        fail(
+          `Collateral token ${token} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.collateralAllowlist.push(token);
@@ -686,9 +874,16 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm adding collateral token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding collateral token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Collateral token ${token} added to allowlist: ${txSig}`,
+        timelock.outcome(`Collateral token ${token} added to allowlist`),
       );
     });
 
@@ -699,12 +894,18 @@ export function installLoopscaleBorrowCommands(
     .description("Remove a collateral token from the allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.loopscaleBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No policy found");
+        fail(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.collateralAllowlist.find((m) => m.equals(token))) {
-        fail("Collateral token not in allowlist. Removal not needed.");
+        fail(
+          `Collateral token not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
       policy.collateralAllowlist = policy.collateralAllowlist.filter(
@@ -718,9 +919,16 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm removing collateral token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing collateral token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Collateral token ${token} removed from allowlist: ${txSig}`,
+        timelock.outcome(`Collateral token ${token} removed from allowlist`),
       );
     });
 
@@ -763,9 +971,9 @@ export function installLoopscaleBorrowCommands(
       const maxLtvBps = parseBps(options.maxLtvBps, "max-ltv-bps");
       const durations = parseDurationIndexes(options.durations, "durations");
 
-      const policy =
-        (await context.glamClient.loopscaleBorrow.fetchPolicy()) ??
-        new LoopscaleBorrowPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleBorrowPolicy();
       const marketPolicy = new LoopscaleBorrowMarketPolicy(
         market,
         maxBorrowAmount,
@@ -777,6 +985,10 @@ export function installLoopscaleBorrowCommands(
         p.market.equals(market),
       );
       const action = existingIndex >= 0 ? "updated" : "added";
+      const previous =
+        existingIndex >= 0
+          ? borrowMarketFields(policy.marketPolicies[existingIndex])
+          : undefined;
       if (existingIndex >= 0) {
         policy.marketPolicies[existingIndex] = marketPolicy;
       } else {
@@ -791,9 +1003,17 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm ${action === "updated" ? "updating" : "adding"} borrow market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm ${action === "updated" ? "updating" : "adding"} borrow market ${market}`,
+              ...marketFieldLines(borrowMarketFields(marketPolicy), previous),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Borrow market ${market} ${action}: ${txSig}`,
+        timelock.outcome(`Borrow market ${market} ${action}`),
       );
     });
 
@@ -807,14 +1027,23 @@ export function installLoopscaleBorrowCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove optional advanced risk limits for a borrow market")
     .action(async (market: PublicKey, options) => {
-      const policy = await context.glamClient.loopscaleBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No borrow policy found");
+        fail(
+          `No borrow policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.marketPolicies.find((p) => p.market.equals(market))) {
-        fail("Market not in borrow policy. Removal not needed.");
+        fail(
+          `Market not in borrow policy${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
+      const removed = policy.marketPolicies.find((p) =>
+        p.market.equals(market),
+      )!;
       policy.marketPolicies = policy.marketPolicies.filter(
         (p) => !p.market.equals(market),
       );
@@ -826,9 +1055,18 @@ export function installLoopscaleBorrowCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm removing borrow market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing the limits of borrow market ${market}:`,
+              ...marketFieldLines(borrowMarketFields(removed)),
+              "The market stays usable under the collateral and principal allowlists, with no per-market limit.",
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale borrow policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Borrow market ${market} removed: ${txSig}`,
+        timelock.outcome(`Limits of borrow market ${market} removed`),
       );
     });
 
@@ -991,7 +1229,11 @@ export function installLoopscaleBorrowCommands(
     .argument("<loan>", "Existing Loopscale loan account", validatePublicKey)
     .argument("<collateral-token>", "Collateral mint address or symbol")
     .argument("<amount>", "Collateral amount")
-    .option("--asset-type [asset-type]", "Asset type enum", "0")
+    .option(
+      "--asset-type [asset-type]",
+      "Asset type enum. Only 0, SPL token collateral, is supported",
+      "0",
+    )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Deposit collateral into an existing Loopscale loan")
     .action(
@@ -1008,7 +1250,19 @@ export function installLoopscaleBorrowCommands(
           cToken,
         );
         const collateralMint = new PublicKey(address);
-        const collateralAmount = parsePositiveUiAmount(amount, decimals);
+        const collateralAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
+        // Read before the confirmation, like the amount. The SDK deposits
+        // SPL token collateral only, and refused another type after it.
+        const collateralAssetType = parseU8(assetType, "asset-type");
+        if (collateralAssetType !== 0) {
+          fail(
+            `asset-type ${collateralAssetType} is not supported: the SDK deposits asset type 0, SPL token collateral, only`,
+          );
+        }
 
         const collateralLabel = `${amount} ${symbol}`;
         await executeTxWithErrorHandling(
@@ -1016,7 +1270,7 @@ export function installLoopscaleBorrowCommands(
             context.glamClient.loopscaleBorrow.depositCollateral(
               {
                 amount: collateralAmount,
-                assetType: parseU8(assetType, "asset-type"),
+                assetType: collateralAssetType,
                 assetIdentifier: collateralMint,
                 assetIndexGuidance: [],
               },
@@ -1032,6 +1286,7 @@ export function installLoopscaleBorrowCommands(
               "Confirm Loopscale deposit-collateral",
               `loan: ${loan}`,
               `collateral: ${collateralLabel}`,
+              `asset type: ${collateralAssetType}`,
             ].join("\n"),
           },
           (txSig) => `Deposited ${collateralLabel} into loan ${loan}: ${txSig}`,
@@ -1077,6 +1332,7 @@ export function installLoopscaleBorrowCommands(
                 c.assetMint.equals(collateralMint),
               );
         if (
+          collateralSlot < 0 ||
           collateralSlot >= loanAccount.collateral.length ||
           !loanAccount.collateral[collateralSlot].assetMint.equals(
             collateralMint,
@@ -1086,7 +1342,11 @@ export function installLoopscaleBorrowCommands(
         }
 
         const collateral = loanAccount.collateral[collateralSlot];
-        const withdrawAmount = parsePositiveUiAmount(amount, decimals);
+        const withdrawAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
         if (withdrawAmount.gt(collateral.amount)) {
           fail(
             `Cannot withdraw ${amount} ${symbol}; collateral slot ${collateralSlot} holds ${collateral.amount.toString()} raw units`,
@@ -1144,18 +1404,13 @@ export function installLoopscaleBorrowCommands(
       "Collateral mint or symbol (required when the loan holds multiple collateral mints)",
     )
     .option(
-      "--weight-matrix <n0,n1,n2,n3,n4>",
-      "Collateral weight matrix to apply before the first borrow",
-      "1000000,0,0,0,0",
-    )
-    .option(
       "--duration-type <n>",
-      "Loopscale quote duration type for a first borrow (0=days, 1=weeks, 2=months, 3=minutes, 4=years)",
+      `Loopscale quote duration type for a first borrow (${LOOPSCALE_DURATION_UNITS.map((unit, type) => `${type}=${unit}s`).join(", ")})`,
       "0",
     )
     .option(
       "--duration <n>",
-      "Loopscale quote duration units for a first borrow",
+      "Loopscale quote duration units for a first borrow. A strategy lends for 1 day, 1 week, 1 month, 3 months or 1 year, and for no other duration",
     )
     .option(
       "--strategy-duration-index <u8>",
@@ -1188,6 +1443,7 @@ export function installLoopscaleBorrowCommands(
           skipSolUnwrap: boolean;
           yes: boolean;
         },
+        command: Command,
       ) => {
         const {
           borrowToken,
@@ -1196,6 +1452,62 @@ export function installLoopscaleBorrowCommands(
           externalYieldSource,
           yes,
         } = options;
+
+        // A borrow takes its terms from an active ledger of the loan, from the
+        // strategy --strategy names, or from the quote API. Each option is
+        // read here, whichever of them applies.
+        const durationType = parseUnsignedNumber(
+          options.durationType,
+          "duration-type",
+          4,
+        );
+        const duration =
+          options.duration === undefined
+            ? undefined
+            : parseUnsignedNumber(options.duration, "duration", U32_MAX);
+        const strategyDurationIndex =
+          options.strategyDurationIndex === undefined
+            ? undefined
+            : parseUnsignedNumber(
+                options.strategyDurationIndex,
+                "strategy-duration-index",
+                STRATEGY_DURATION_COUNT - 1,
+              );
+        const externalYieldSourceFilter =
+          externalYieldSource === undefined
+            ? undefined
+            : parseUnsignedNumber(
+                externalYieldSource,
+                "external-yield-source",
+                U8_MAX,
+              );
+        // --strategy rules the quote API out, and its absence rules the
+        // strategy's own terms out. An option of the other side would change
+        // nothing, so it is refused.
+        if (options.strategy === undefined) {
+          if (strategyDurationIndex !== undefined) {
+            fail("--strategy-duration-index applies only with --strategy");
+          }
+        } else {
+          const quoteOnly = [
+            [
+              "--duration-type",
+              command.getOptionValueSource("durationType") === "cli",
+            ],
+            ["--duration", duration !== undefined],
+            [
+              "--external-yield-source",
+              externalYieldSourceFilter !== undefined,
+            ],
+          ] as const;
+          for (const [flag, given] of quoteOnly) {
+            if (given) {
+              fail(
+                `${flag} applies only without --strategy, which takes the borrow's terms from the strategy`,
+              );
+            }
+          }
+        }
 
         const loanAccount =
           await context.glamClient.loopscaleBorrow.fetchOwnedLoan(loan);
@@ -1321,7 +1633,11 @@ export function installLoopscaleBorrowCommands(
           context.glamClient,
           principalMint.toBase58(),
         );
-        const borrowAmount = parsePositiveUiAmount(amount, decimals);
+        const borrowAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
 
         if (ledgerMatch) {
           const selectedCollateralWeight =
@@ -1336,11 +1652,16 @@ export function installLoopscaleBorrowCommands(
         // Reuse the strategy and terms from an existing active ledger borrowing
         // the same principal, instead of quoting for a (possibly different) strategy.
         // FIXME: this may fail if the same strategy doesn't have enough capacity
+        //
+        // The duration index that is sent is the slot of a term. A strategy
+        // may lend several terms at one APY, so the SDK is told the term: the
+        // ledger's own, or the one the quote was asked for.
         const {
           strategy,
           expectedLoanValues,
           assetIndexGuidance,
           durationIndex,
+          duration: sentTerm,
         } = ledgerMatch
           ? await (async () => {
               const { ledger } = ledgerMatch;
@@ -1361,26 +1682,19 @@ export function installLoopscaleBorrowCommands(
                   assetIdentifier,
                   expectedApy,
                   expectedLqt,
+                  duration: ledger.duration,
                 },
               );
             })()
           : targetStrategy
             ? await (async () => {
-                const requestedDurationIndex =
-                  options.strategyDurationIndex === undefined
-                    ? undefined
-                    : parseUnsignedNumber(
-                        options.strategyDurationIndex,
-                        "strategy-duration-index",
-                        STRATEGY_DURATION_COUNT - 1,
-                      );
                 const terms =
                   await context.glamClient.loopscaleBorrow.resolveBorrowTermsFromTargetStrategy(
                     {
                       strategy: targetStrategy,
                       principalMint,
                       assetIdentifier,
-                      requestedDurationIndex,
+                      requestedDurationIndex: strategyDurationIndex,
                     },
                   );
                 console.log(
@@ -1390,32 +1704,14 @@ export function installLoopscaleBorrowCommands(
               })()
             : await (async () => {
                 const quoteDurationType =
-                  options.duration === undefined && inferredLedgerMatch
+                  duration === undefined && inferredLedgerMatch
                     ? inferredLedgerMatch.ledger.duration.durationType
-                    : parseUnsignedNumber(
-                        options.durationType,
-                        "duration-type",
-                        4,
-                      );
+                    : durationType;
                 const quoteDuration =
-                  options.duration === undefined
-                    ? inferredLedgerMatch?.ledger.duration.duration
-                    : parseUnsignedNumber(
-                        options.duration,
-                        "duration",
-                        U32_MAX,
-                      );
+                  duration ?? inferredLedgerMatch?.ledger.duration.duration;
                 if (quoteDuration === undefined) {
                   fail("--duration is required for the first borrow");
                 }
-                const externalYieldSourceFilter =
-                  externalYieldSource === undefined
-                    ? undefined
-                    : parseUnsignedNumber(
-                        externalYieldSource,
-                        "external-yield-source",
-                        U8_MAX,
-                      );
                 const quotes =
                   await context.glamClient.loopscaleBorrow.fetchMaxQuotes({
                     principalMint,
@@ -1467,6 +1763,10 @@ export function installLoopscaleBorrowCommands(
                       assetIdentifier,
                       expectedApy: new BN(String(quote.apy)),
                       expectedLqt: [Number(quote.lqt), 0, 0, 0, 0],
+                      duration: {
+                        durationType: quoteDurationType,
+                        duration: quoteDuration,
+                      },
                     },
                   );
                 console.log(
@@ -1474,6 +1774,49 @@ export function installLoopscaleBorrowCommands(
                 );
                 return quoteTerms;
               })();
+
+        // A further borrow on an active ledger takes that ledger's terms. An
+        // option that asks for other terms is refused. --external-yield-source
+        // only filters quotes, so it has nothing here to differ from.
+        if (ledgerMatch) {
+          const ledgerTerms = ledgerMatch.ledger.duration;
+          // As on the quote path, --duration is read with its type, which is
+          // 0 unless --duration-type gives another.
+          const asked =
+            duration !== undefined
+              ? `--duration ${duration} of type ${durationType}`
+              : command.getOptionValueSource("durationType") === "cli"
+                ? `--duration-type ${durationType}`
+                : undefined;
+          if (
+            asked !== undefined &&
+            ((duration !== undefined && duration !== ledgerTerms.duration) ||
+              durationType !== ledgerTerms.durationType)
+          ) {
+            fail(
+              `${asked} does not apply: the loan's active ledger ${ledgerMatch.index} has duration ${ledgerTerms.duration} of type ${ledgerTerms.durationType}, and a further borrow takes its terms`,
+            );
+          }
+          // The index that is sent stands for a term, and that term is the
+          // ledger's, whatever else the strategy lends at the ledger's APY.
+          if (
+            sentTerm.duration !== ledgerTerms.duration ||
+            sentTerm.durationType !== ledgerTerms.durationType
+          ) {
+            fail(
+              `Duration index ${durationIndex} stands for duration ${sentTerm.duration} of type ${sentTerm.durationType}, and the loan's active ledger ${ledgerMatch.index} has duration ${ledgerTerms.duration} of type ${ledgerTerms.durationType}, whose term a further borrow takes`,
+            );
+          }
+          // The index that is sent is the one the SDK resolves for the ledger.
+          if (
+            strategyDurationIndex !== undefined &&
+            strategyDurationIndex !== durationIndex
+          ) {
+            fail(
+              `--strategy-duration-index ${strategyDurationIndex} does not apply: a further borrow on the loan's active ledger ${ledgerMatch.index} is sent with duration index ${durationIndex}`,
+            );
+          }
+        }
 
         const principalLabel = `${amount} ${symbol}`;
         const confirmMessage = [
@@ -1483,6 +1826,7 @@ export function installLoopscaleBorrowCommands(
           `collateral mint: ${collateralMint}`,
           `expected apy: ${expectedLoanValues.expectedApy.toString()}`,
           `expected lqt: [${expectedLoanValues.expectedLqt.join(", ")}]`,
+          `duration index: ${durationIndex} (${formatLoopscaleDuration(sentTerm)})`,
           `borrow: ${principalLabel}`,
         ].join("\n");
 
@@ -1566,7 +1910,11 @@ export function installLoopscaleBorrowCommands(
         // On a full repay, on-chain repays the full amount due; pass principalDue
         // as a ceiling. The borrower ATA must be funded above principalDue to
         // cover accrued interest.
-        const repayAmount = parsePositiveUiAmount(amount, decimals, "amount");
+        const repayAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
         const { principalMint: strategyPrincipalMint } =
           await context.glamClient.loopscaleBorrow.fetchStrategy(strategy);
         if (!strategyPrincipalMint.equals(principalMint)) {

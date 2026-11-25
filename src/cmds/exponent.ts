@@ -37,7 +37,13 @@ import {
   printTable,
   validatePublicKey,
 } from "../utils";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
 import { fail } from "../errors";
+import { I64_MAX_BN } from "../parsing";
 
 const EXPONENT_CORE_PROTOCOL = 0b1;
 const U64_MAX = new BN("18446744073709551615");
@@ -139,19 +145,34 @@ function validatePolicy(policy: ExponentPolicy) {
   }
 }
 
+/** The Exponent policy an edit replaces: the staged one under a timelock that holds one. */
+async function exponentPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => fetchPolicy(context),
+    () => context.glamClient.extExponentProgram.programId,
+    EXPONENT_CORE_PROTOCOL,
+    ExponentPolicy.decode,
+  );
+}
+
 async function setPolicy(
   context: CliContext,
   policy: ExponentPolicy,
   options: CliTxOptions,
   message: string,
-  success: (txSig: string) => string,
+  success: string,
+  timelock?: VaultTimelock,
 ) {
   validatePolicy(policy);
+  const vaultTimelock = timelock ?? (await readVaultTimelock(context));
   await executeTxWithErrorHandling(
     () =>
       context.glamClient.exponent.setExponentPolicy(policy, context.txOptions),
-    { skip: !!options.yes, message },
-    success,
+    { skip: !!options.yes, message: vaultTimelock.confirm(message) },
+    vaultTimelock.outcome(success),
   );
 }
 
@@ -160,11 +181,25 @@ async function updatePolicy(
   mutate: (policy: ExponentPolicy) => void,
   options: CliTxOptions,
   message: string,
-  success: (txSig: string) => string,
+  success: string,
 ) {
-  const policy = (await fetchPolicy(context)) ?? defaultPolicy();
+  const timelock = await readVaultTimelock(context);
+  const base = await exponentPolicyToEdit(context, timelock);
+  const policy = base.value ?? defaultPolicy();
   mutate(policy);
-  await setPolicy(context, policy, options, message, success);
+  await setPolicy(
+    context,
+    policy,
+    options,
+    [
+      message,
+      ...(base.stagedApart
+        ? [editsStagedLine("the Exponent Core policy")]
+        : []),
+    ].join("\n"),
+    success,
+    timelock,
+  );
 }
 
 function addUniqueEntry(list: PublicKey[], pubkey: PublicKey, label: string) {
@@ -193,6 +228,20 @@ function parseU64(value: string, label: string, allowZero = false): BN {
   }
   if (!allowZero && parsed.isZero()) {
     fail(`${label} must be greater than zero`);
+  }
+  return parsed;
+}
+
+/**
+ * The PT amount of a trade. The wrapper hands it to Exponent as an i64, and
+ * the program refuses one that does not fit.
+ */
+function parseTradePtAmount(value: string): BN {
+  const parsed = parseU64(value, "pt-amount-raw");
+  if (parsed.gt(I64_MAX_BN)) {
+    fail(
+      `pt-amount-raw exceeds ${I64_MAX_BN.toString()}, the i64 maximum: Exponent takes a trade's PT amount as an i64`,
+    );
   }
   return parsed;
 }
@@ -371,11 +420,13 @@ function loadJson(raw: string, label: string): unknown {
   }
 }
 
-function parseRemainingAccounts(raw: string | undefined): AccountMeta[] {
-  if (!raw) {
-    return [];
-  }
-
+/**
+ * The accounts --remaining-accounts gives, read once, before the
+ * confirmation: the transaction is built from what this returned. An empty
+ * value, as an unset shell variable gives, is refused like other text that
+ * is no JSON.
+ */
+function parseRemainingAccounts(raw: string): AccountMeta[] {
   const parsed = loadJson(raw, "remaining-accounts");
   if (!Array.isArray(parsed)) {
     fail("remaining-accounts must be a JSON array");
@@ -404,6 +455,14 @@ function parseRemainingAccounts(raw: string | undefined): AccountMeta[] {
     if (!pubkey) {
       fail(`remaining-accounts[${index}] is missing pubkey`);
     }
+    // A string such as "false" is truthy and would mark the account. A flag
+    // left out, or given as null, is false.
+    for (const flag of ["isSigner", "isWritable"] as const) {
+      const given: unknown = meta[flag];
+      if (given !== undefined && given !== null && typeof given !== "boolean") {
+        fail(`remaining-accounts[${index}].${flag} must be true or false`);
+      }
+    }
 
     return {
       pubkey: validatePublicKey(pubkey),
@@ -411,6 +470,25 @@ function parseRemainingAccounts(raw: string | undefined): AccountMeta[] {
       isWritable: meta.isWritable ?? false,
     };
   });
+}
+
+/**
+ * A split index divides the remaining accounts between the wrapper's two
+ * CPIs, and the program refuses one past the accounts it is given.
+ */
+function requireSplitWithinRemainingAccounts(
+  flag: string,
+  splitIndex: number,
+  remainingAccounts: AccountMeta[] | undefined,
+) {
+  const given = remainingAccounts?.length ?? 0;
+  if (splitIndex > given) {
+    fail(
+      remainingAccounts === undefined
+        ? `${flag} ${splitIndex} applies only with --remaining-accounts: without it the wrapper is given no accounts to split`
+        : `${flag} ${splitIndex} is past the ${given} accounts --remaining-accounts gives`,
+    );
+  }
 }
 
 function txOptionsWithLookupTables(
@@ -714,10 +792,15 @@ async function wrapperCpiAccountMetasForMarket(
   };
 }
 
+/**
+ * The accounts and options of a trade. `remainingAccounts` are the ones
+ * --remaining-accounts gave, already read; without them they are derived.
+ */
 async function marketCallArgs(
   context: CliContext,
   options: ExponentMarketAccountsOptions,
   cpiAccountsKind: "depositSy" | "withdrawSy",
+  remainingAccounts: AccountMeta[] | undefined,
 ) {
   const { market } = await fetchMarket(context, options.market);
   const tokenProgram = options.tokenProgram ?? TOKEN_PROGRAM_ID;
@@ -754,7 +837,7 @@ async function marketCallArgs(
   }
 
   const derivedRemainingAccounts =
-    options.remainingAccounts === undefined
+    remainingAccounts === undefined
       ? await wrapperCpiAccountMetasForMarket(
           context,
           market,
@@ -763,9 +846,6 @@ async function marketCallArgs(
           tokenProgram,
         )
       : null;
-  const remainingAccounts =
-    derivedRemainingAccounts?.remainingAccounts ??
-    parseRemainingAccounts(options.remainingAccounts!);
   preInstructions.push(...(derivedRemainingAccounts?.preInstructions ?? []));
 
   return {
@@ -782,7 +862,8 @@ async function marketCallArgs(
         options.tokenFeeTreasurySy ?? market.tokenFeeTreasurySy,
       eventAuthority: options.eventAuthority,
       tokenProgram,
-      remainingAccounts,
+      remainingAccounts:
+        derivedRemainingAccounts?.remainingAccounts ?? remainingAccounts!,
     },
     splitIndex: derivedRemainingAccounts?.splitIndex,
     txOptions: {
@@ -1052,7 +1133,10 @@ function addMergeAccountOptions(command: Command): Command {
     );
 }
 
-function mergeAccounts(options: ExponentMergeAccountsOptions) {
+function mergeAccounts(
+  options: ExponentMergeAccountsOptions,
+  remainingAccounts: AccountMeta[],
+) {
   return {
     tokenSyMerger: options.tokenSyMerger,
     vault: options.vault,
@@ -1067,7 +1151,7 @@ function mergeAccounts(options: ExponentMergeAccountsOptions) {
     syProgram: options.syProgram,
     eventAuthority: options.eventAuthority,
     tokenProgram: options.tokenProgram,
-    remainingAccounts: parseRemainingAccounts(options.remainingAccounts),
+    remainingAccounts,
   };
 }
 
@@ -1191,12 +1275,46 @@ export function installExponentCommands(
           uniquePubkeys(options.market ?? []),
           uniquePubkeys(options.vault ?? []),
         );
+        // The whole policy is written: an entry left out of the options is
+        // removed, and an empty pair refuses every Exponent operation.
+        const timelock = await readVaultTimelock(context);
+        const replaced = (await exponentPolicyToEdit(context, timelock)).value;
+        const listLine = (
+          label: string,
+          next: PublicKey[],
+          previous: PublicKey[],
+        ) => {
+          const removed = previous.filter(
+            (key) => !next.some((kept) => kept.equals(key)),
+          );
+          const kept = next.length > 0 ? next.join(", ") : "none";
+          return `  ${label}: ${kept}${removed.length > 0 ? ` (removes ${removed.join(", ")})` : ""}`;
+        };
         await setPolicy(
           context,
           policy,
           options,
-          "Replace Exponent Core policy?",
-          (txSig) => `Exponent Core policy set: ${txSig}`,
+          [
+            "Replace the Exponent Core policy?",
+            listLine(
+              "markets",
+              policy.marketsAllowlist,
+              replaced?.marketsAllowlist ?? [],
+            ),
+            listLine(
+              "vaults",
+              policy.vaultsAllowlist,
+              replaced?.vaultsAllowlist ?? [],
+            ),
+            ...(policy.marketsAllowlist.length === 0 &&
+            policy.vaultsAllowlist.length === 0
+              ? [
+                  "With no market and no vault on it, the policy refuses every Exponent buy, sell, merge and redemption.",
+                ]
+              : []),
+          ].join("\n"),
+          `Exponent Core policy set`,
+          timelock,
         );
       },
     );
@@ -1211,7 +1329,7 @@ export function installExponentCommands(
         defaultPolicy(),
         options,
         "Reset Exponent Core policy to default?",
-        (txSig) => `Exponent Core policy reset: ${txSig}`,
+        `Exponent Core policy reset`,
       );
     });
 
@@ -1226,7 +1344,7 @@ export function installExponentCommands(
         (policy) => addUniqueEntry(policy.marketsAllowlist, pubkey, "Market"),
         options,
         `Add Exponent market ${pubkey} to allowlist?`,
-        (txSig) => `Exponent market added to allowlist: ${txSig}`,
+        `Exponent market added to allowlist`,
       );
     });
 
@@ -1247,7 +1365,7 @@ export function installExponentCommands(
         },
         options,
         `Remove Exponent market ${pubkey} from allowlist?`,
-        (txSig) => `Exponent market removed from allowlist: ${txSig}`,
+        `Exponent market removed from allowlist`,
       );
     });
 
@@ -1262,7 +1380,7 @@ export function installExponentCommands(
         (policy) => addUniqueEntry(policy.vaultsAllowlist, pubkey, "Vault"),
         options,
         `Add Exponent vault ${pubkey} to allowlist?`,
-        (txSig) => `Exponent vault added to allowlist: ${txSig}`,
+        `Exponent vault added to allowlist`,
       );
     });
 
@@ -1283,7 +1401,7 @@ export function installExponentCommands(
         },
         options,
         `Remove Exponent vault ${pubkey} from allowlist?`,
-        (txSig) => `Exponent vault removed from allowlist: ${txSig}`,
+        `Exponent vault removed from allowlist`,
       );
     });
 
@@ -1291,7 +1409,10 @@ export function installExponentCommands(
     exponent
       .command("buy-pt")
       .argument("<pt-amount-raw>", "Raw PT amount in base units")
-      .argument("<max-base-amount-raw>", "Raw max base amount in base units")
+      .argument(
+        "<max-base-amount-raw>",
+        "Raw base amount in base units. All of it is converted to SY before the trade, which spends at most that SY",
+      )
       .option(
         "--mint-sy-rem-accounts-until <index>",
         "remaining_accounts split index between mint SY and trade PT CPIs",
@@ -1306,23 +1427,49 @@ export function installExponentCommands(
         maxBaseAmountRaw: string,
         options: ExponentMarketAccountsOptions &
           CliTxOptions & { mintSyRemAccountsUntil: number },
+        command: Command,
       ) => {
+        // Without --remaining-accounts the accounts are derived, and their
+        // split with them: an index given alone would change nothing.
+        if (
+          options.remainingAccounts === undefined &&
+          command.getOptionValueSource("mintSyRemAccountsUntil") === "cli"
+        ) {
+          fail(
+            "--mint-sy-rem-accounts-until applies only with --remaining-accounts",
+          );
+        }
+        // The accounts are read once, here, and the transaction is built
+        // from them: a file read again after the confirmation could hold
+        // others. A split given with them is held to their count.
+        const remainingAccounts =
+          options.remainingAccounts === undefined
+            ? undefined
+            : parseRemainingAccounts(options.remainingAccounts);
+        if (remainingAccounts !== undefined) {
+          requireSplitWithinRemainingAccounts(
+            "--mint-sy-rem-accounts-until",
+            options.mintSyRemAccountsUntil,
+            remainingAccounts,
+          );
+        }
+        // Both amounts are read before the confirmation, which shows them.
+        const ptAmount = parseTradePtAmount(ptAmountRaw);
+        const maxBaseAmount = parseU64(maxBaseAmountRaw, "max-base-amount-raw");
         await executeTxWithErrorHandling(
           async () => {
             const { accounts, splitIndex, txOptions } = await marketCallArgs(
               context,
               options,
               "depositSy",
+              remainingAccounts,
             );
             return context.glamClient.exponent.wrapperBuyPt(
               {
-                ptAmount: parseU64(ptAmountRaw, "pt-amount-raw"),
-                maxBaseAmount: parseU64(
-                  maxBaseAmountRaw,
-                  "max-base-amount-raw",
-                ),
+                ptAmount,
+                maxBaseAmount,
                 mintSyRemAccountsUntil:
-                  options.remainingAccounts === undefined
+                  remainingAccounts === undefined
                     ? splitIndex!
                     : options.mintSyRemAccountsUntil,
               },
@@ -1332,7 +1479,9 @@ export function installExponentCommands(
           },
           {
             skip: !!options.yes,
-            message: `Buy ${ptAmountRaw} raw PT from Exponent market ${options.market}?`,
+            // The wrapper mints SY from the whole base amount, then trades: the
+            // amount caps what the PT costs, and none of it stays as base.
+            message: `Buy ${ptAmount.toString()} raw PT from Exponent market ${options.market}, converting all of ${maxBaseAmount.toString()} raw base into SY first? The trade spends at most that SY, and the SY it does not spend stays in the vault's SY token account.`,
           },
           (txSig) => `Bought Exponent PT: ${txSig}`,
         );
@@ -1358,24 +1507,49 @@ export function installExponentCommands(
         minBaseAmountRaw: string,
         options: ExponentMarketAccountsOptions &
           CliTxOptions & { redeemSyRemAccountsUntil: number },
+        command: Command,
       ) => {
+        // As in buy-pt: the split is derived with the accounts.
+        if (
+          options.remainingAccounts === undefined &&
+          command.getOptionValueSource("redeemSyRemAccountsUntil") === "cli"
+        ) {
+          fail(
+            "--redeem-sy-rem-accounts-until applies only with --remaining-accounts",
+          );
+        }
+        const remainingAccounts =
+          options.remainingAccounts === undefined
+            ? undefined
+            : parseRemainingAccounts(options.remainingAccounts);
+        if (remainingAccounts !== undefined) {
+          requireSplitWithinRemainingAccounts(
+            "--redeem-sy-rem-accounts-until",
+            options.redeemSyRemAccountsUntil,
+            remainingAccounts,
+          );
+        }
+        // Both amounts are read before the confirmation, which shows them.
+        const amountPt = parseTradePtAmount(ptAmountRaw);
+        const minBaseAmount = parseU64(
+          minBaseAmountRaw,
+          "min-base-amount-raw",
+          true,
+        );
         await executeTxWithErrorHandling(
           async () => {
             const { accounts, splitIndex, txOptions } = await marketCallArgs(
               context,
               options,
               "withdrawSy",
+              remainingAccounts,
             );
             return context.glamClient.exponent.wrapperSellPt(
               {
-                amountPt: parseU64(ptAmountRaw, "pt-amount-raw"),
-                minBaseAmount: parseU64(
-                  minBaseAmountRaw,
-                  "min-base-amount-raw",
-                  true,
-                ),
+                amountPt,
+                minBaseAmount,
                 redeemSyRemAccountsUntil:
-                  options.remainingAccounts === undefined
+                  remainingAccounts === undefined
                     ? splitIndex!
                     : options.redeemSyRemAccountsUntil,
               },
@@ -1385,7 +1559,7 @@ export function installExponentCommands(
           },
           {
             skip: !!options.yes,
-            message: `Sell ${ptAmountRaw} raw PT into Exponent market ${options.market}?`,
+            message: `Sell ${amountPt.toString()} raw PT into Exponent market ${options.market} for at least ${minBaseAmount.toString()} raw base?`,
           },
           (txSig) => `Sold Exponent PT: ${txSig}`,
         );
@@ -1424,9 +1598,10 @@ export function installExponentCommands(
             tokenProgram: PublicKey;
           },
       ) => {
+        // The amount is read before the confirmation, which shows it.
+        const amountPy = parseU64(ptAmountRaw, "pt-amount-raw");
         await executeTxWithErrorHandling(
           async () => {
-            const amountPy = parseU64(ptAmountRaw, "pt-amount-raw");
             const { accounts, splitIndex, txOptions } = await redeemPtCallArgs(
               context,
               options,
@@ -1442,7 +1617,7 @@ export function installExponentCommands(
           },
           {
             skip: !!options.yes,
-            message: `Redeem ${ptAmountRaw} raw expired PT from Exponent market ${options.market}?`,
+            message: `Redeem ${amountPy.toString()} raw expired PT from Exponent market ${options.market}?`,
           },
           (txSig) => `Redeemed expired Exponent PT: ${txSig}`,
         );
@@ -1467,19 +1642,32 @@ export function installExponentCommands(
         options: ExponentMergeAccountsOptions &
           CliTxOptions & { redeemSyAccountsUntil: number },
       ) => {
+        // Read once, as in buy-pt. Without --remaining-accounts the wrapper
+        // is given none, and only a split of 0 fits.
+        const remainingAccounts =
+          options.remainingAccounts === undefined
+            ? undefined
+            : parseRemainingAccounts(options.remainingAccounts);
+        requireSplitWithinRemainingAccounts(
+          "--redeem-sy-accounts-until",
+          options.redeemSyAccountsUntil,
+          remainingAccounts,
+        );
+        // The amount is read before the confirmation, which shows it.
+        const amountPy = parseU64(pyAmountRaw, "py-amount-raw");
         await executeTxWithErrorHandling(
           () =>
             context.glamClient.exponent.wrapperMerge(
               {
-                amountPy: parseU64(pyAmountRaw, "py-amount-raw"),
+                amountPy,
                 redeemSyAccountsUntil: options.redeemSyAccountsUntil,
               },
-              mergeAccounts(options),
+              mergeAccounts(options, remainingAccounts ?? []),
               txOptionsWithLookupTables(context, options),
             ),
           {
             skip: !!options.yes,
-            message: `Merge ${pyAmountRaw} raw Exponent PT/YT in vault ${options.vault}?`,
+            message: `Merge ${amountPy.toString()} raw Exponent PT/YT in vault ${options.vault}?`,
           },
           (txSig) => `Merged Exponent PT/YT: ${txSig}`,
         );

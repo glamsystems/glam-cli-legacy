@@ -1,4 +1,6 @@
 import {
+  JUPITER_SWAP_PROTOCOL,
+  JUPITER_V1_MAX_QUOTE_ACCOUNTS,
   JupiterSwapPolicy,
   type QuoteParams,
   type TokenListItem,
@@ -12,11 +14,28 @@ import {
   resolveTokenPublicKey,
 } from "../utils";
 import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import { fail } from "../errors";
+import {
+  parseBps,
   parseInteger,
   parsePositiveInteger,
   parsePositiveUiAmount,
+  requireSafeIntegerAmount,
   validatePublicKey,
 } from "../parsing";
+
+// The swap policy and Jupiter's route both hold slippage as a u16.
+function parseSlippageBps(value: string): number {
+  const slippageBps = parseBps(value, "slippage-bps");
+  if (slippageBps === 0) {
+    fail("slippage-bps must be a positive integer");
+  }
+  return slippageBps;
+}
 
 function buildQuoteParams(
   tokenFrom: TokenListItem,
@@ -32,19 +51,23 @@ function buildQuoteParams(
   const { maxAccounts, slippageBps, onlyDirectRoutes, instructionVersion } =
     options;
 
+  const amountIn = requireSafeIntegerAmount(
+    parsePositiveUiAmount(`${amount}`, tokenFrom.decimals, "amount"),
+    "amount",
+    "the Jupiter quote API",
+  );
+
   return {
     inputMint: tokenFrom.address,
     outputMint: tokenTo.address,
-    amount: parsePositiveUiAmount(
-      `${amount}`,
-      tokenFrom.decimals,
-      "amount",
-    ).toNumber(),
+    amount: amountIn.toNumber(),
     swapMode: "ExactIn",
-    slippageBps: parsePositiveInteger(slippageBps, "slippage-bps"),
+    slippageBps: parseSlippageBps(slippageBps),
     excludeDexes: ["Obric V2"],
     asLegacyTransaction: false,
-    ...(maxAccounts
+    // An option given with an empty value is read, and refused, like any
+    // other: it is not the same as an option left out.
+    ...(maxAccounts !== undefined
       ? { maxAccounts: parsePositiveInteger(maxAccounts, "max-accounts") }
       : {}),
     ...(onlyDirectRoutes ? { onlyDirectRoutes } : {}),
@@ -52,22 +75,75 @@ function buildQuoteParams(
   };
 }
 
-export async function addJupiterOnlyDirectRoutesSuggestion<T>(
+/**
+ * The account cap the quote is asked with. On a version 1 transaction the SDK
+ * asks Jupiter for at most 40 accounts, the given cap or not.
+ */
+function quoteAccountsLines(
+  context: CliContext,
   quoteParams: QuoteParams,
-  execute: (quoteParams: QuoteParams) => Promise<T>,
-  operationLabel = "swap",
-): Promise<T> {
-  try {
-    return await execute(quoteParams);
-  } catch (error) {
-    if (quoteParams.onlyDirectRoutes) {
-      throw error;
-    }
-
-    throw new Error(
-      `${error}\nSuggestion: retry ${operationLabel} with --only-direct-routes.`,
-    );
+): string[] {
+  const version = context.glamClient.resolveTransactionVersion(
+    context.txOptions.transactionVersion,
+  );
+  if (version !== 1) {
+    return [];
   }
+  const asked = Math.min(
+    quoteParams.maxAccounts ?? JUPITER_V1_MAX_QUOTE_ACCOUNTS,
+    JUPITER_V1_MAX_QUOTE_ACCOUNTS,
+  );
+  const given =
+    quoteParams.maxAccounts !== undefined &&
+    quoteParams.maxAccounts > JUPITER_V1_MAX_QUOTE_ACCOUNTS
+      ? `${quoteParams.maxAccounts} given; `
+      : "";
+  return [
+    `Max accounts asked of the quote: ${asked} (${given}a version 1 transaction holds no more of a route)`,
+  ];
+}
+
+// What a swap that failed with nothing sent is told. A quote that already
+// asked for direct routes is told nothing.
+function onlyDirectRoutesAdvice(
+  quoteParams: QuoteParams,
+  operationLabel: string,
+): string | undefined {
+  return quoteParams.onlyDirectRoutes
+    ? undefined
+    : `Suggestion: retry ${operationLabel} with --only-direct-routes.`;
+}
+
+// The cap allowlist-token gives a policy it creates.
+const DEFAULT_MAX_SLIPPAGE_BPS = 50;
+
+/**
+ * What a setter writes, for its confirmation: the policy it creates when the
+ * vault has none, or the fields the policy then holds.
+ */
+function policySentLine(policy: JupiterSwapPolicy, created: boolean): string {
+  const count = policy.swapAllowlist?.length ?? 0;
+  const fields = [
+    `max slippage ${policy.maxSlippageBps} BPS${policy.maxSlippageBps === 0 ? " (no swap this CLI sends passes it)" : ""}`,
+    `max deviation ${policy.maxDeviationBps} BPS`,
+    `${count} token${count === 1 ? "" : "s"} on the swap allowlist`,
+  ].join(", ");
+  return created
+    ? `The vault has no Jupiter swap policy; this creates one with ${fields}.`
+    : `The policy then holds ${fields}.`;
+}
+
+/** The Jupiter swap policy an edit replaces: the staged one under a timelock that holds one. */
+async function jupiterSwapPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.jupiterSwap.fetchPolicy(),
+    () => context.glamClient.protocolProgram.programId,
+    JUPITER_SWAP_PROTOCOL,
+    JupiterSwapPolicy.decode,
+  );
 }
 
 export function installJupiterSwapCommands(
@@ -93,12 +169,14 @@ export function installJupiterSwapCommands(
     .argument(
       "<slippage-bps>",
       "Maximum slippage in basis points",
-      (value: string) => parsePositiveInteger(value, "slippage-bps"),
+      parseSlippageBps,
     )
     .option("-y, --yes", "Skip confirmation", false)
     .description("Set the maximum allowed slippage for swaps")
     .action(async (slippageBps, options) => {
-      const policy = await context.glamClient.jupiterSwap.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterSwapPolicyToEdit(context, timelock);
+      const policy = base.value;
       const currentAllowlist = policy?.swapAllowlist || [];
       const currentMaxDeviation = policy?.maxDeviationBps || 0;
 
@@ -115,9 +193,17 @@ export function installJupiterSwapCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm setting max slippage to ${slippageBps} BPS`,
+          message: timelock.confirm(
+            [
+              `Confirm setting max slippage to ${slippageBps} BPS`,
+              policySentLine(newPolicy, policy === null),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter swap policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Max slippage set to ${slippageBps} BPS: ${txSig}`,
+        timelock.outcome(`Max slippage set to ${slippageBps} BPS`),
       );
     });
 
@@ -133,7 +219,9 @@ export function installJupiterSwapCommands(
     .option("-y, --yes", "Skip confirmation", false)
     .description("Set the maximum allowed quote price deviation for swaps")
     .action(async (deviationBps, options) => {
-      const policy = await context.glamClient.jupiterSwap.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterSwapPolicyToEdit(context, timelock);
+      const policy = base.value;
       const currentAllowlist = policy?.swapAllowlist || [];
       const currentMaxSlippage = policy?.maxSlippageBps || 0;
 
@@ -150,9 +238,17 @@ export function installJupiterSwapCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm setting max deviation to ${deviationBps} BPS`,
+          message: timelock.confirm(
+            [
+              `Confirm setting max deviation to ${deviationBps} BPS`,
+              policySentLine(newPolicy, policy === null),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter swap policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Max deviation set to ${deviationBps} BPS: ${txSig}`,
+        timelock.outcome(`Max deviation set to ${deviationBps} BPS`),
       );
     });
 
@@ -164,12 +260,19 @@ export function installJupiterSwapCommands(
     .description("Add a token to the swap allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.jupiterSwap.fetchPolicy();
-      const currentSlippage = policy?.maxSlippageBps || 50;
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterSwapPolicyToEdit(context, timelock);
+      const policy = base.value;
+      // A stored cap of 0 refuses every swap; `|| 50` raised it to 50.
+      const currentSlippage = policy
+        ? policy.maxSlippageBps
+        : DEFAULT_MAX_SLIPPAGE_BPS;
       const currentAllowlist = policy?.swapAllowlist || [];
 
       if (currentAllowlist.find((t) => t.equals(token))) {
-        console.error(`Token ${token} is already in the allowlist`);
+        console.error(
+          `Token ${token} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
 
@@ -187,9 +290,17 @@ export function installJupiterSwapCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm adding token ${token} to swap allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding token ${token} to swap allowlist`,
+              policySentLine(newPolicy, policy === null),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter swap policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Token ${token} added to swap allowlist: ${txSig}`,
+        timelock.outcome(`Token ${token} added to swap allowlist`),
       );
     });
 
@@ -201,14 +312,20 @@ export function installJupiterSwapCommands(
     .description("Remove a token from the swap allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.jupiterSwap.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterSwapPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy || !policy.swapAllowlist) {
-        console.error("No swap allowlist found");
+        console.error(
+          `No swap allowlist found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
 
       if (!policy.swapAllowlist.find((t) => t.equals(token))) {
-        console.error("Token not in allowlist. Removal not needed.");
+        console.error(
+          `Token not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
         process.exit(1);
       }
 
@@ -226,9 +343,17 @@ export function installJupiterSwapCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm removing token ${token} from swap allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing token ${token} from swap allowlist`,
+              policySentLine(newPolicy, false),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter swap policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Token ${token} removed from swap allowlist: ${txSig}`,
+        timelock.outcome(`Token ${token} removed from swap allowlist`),
       );
     });
 
@@ -237,9 +362,13 @@ export function installJupiterSwapCommands(
     .option("-y, --yes", "Skip confirmation", false)
     .description("Clear the swap allowlist")
     .action(async (options) => {
-      const policy = await context.glamClient.jupiterSwap.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterSwapPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       const newPolicy = new JupiterSwapPolicy(
@@ -255,9 +384,17 @@ export function installJupiterSwapCommands(
           ),
         {
           skip: options?.yes,
-          message: "Confirm clearing swap allowlist",
+          message: timelock.confirm(
+            [
+              "Confirm clearing swap allowlist",
+              policySentLine(newPolicy, false),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter swap policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Swap allowlist cleared: ${txSig}`,
+        timelock.outcome("Swap allowlist cleared"),
       );
     });
 
@@ -301,28 +438,24 @@ export function installJupiterSwapCommands(
 
       await executeTxWithErrorHandling(
         () =>
-          addJupiterOnlyDirectRoutesSuggestion(
-            quoteParams,
-            (retryQuoteParams) =>
-              context.glamClient.jupiterSwap.swap(
-                {
-                  quoteParams: retryQuoteParams,
-                  trackingAccount,
-                },
-                context.txOptions,
-              ),
-            "swap",
+          context.glamClient.jupiterSwap.swap(
+            { quoteParams, trackingAccount },
+            context.txOptions,
           ),
         {
           skip: options?.yes,
-          message: `Confirm swapping ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol} with quote params: ${JSON.stringify(
-            quoteParams,
-            null,
-            2,
-          )}`,
+          message: [
+            `Confirm swapping ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol} with quote params: ${JSON.stringify(
+              quoteParams,
+              null,
+              2,
+            )}`,
+            ...quoteAccountsLines(context, quoteParams),
+          ].join("\n"),
         },
         (txSig) =>
           `Swapped ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol}: ${txSig}`,
+        onlyDirectRoutesAdvice(quoteParams, "swap"),
       );
     });
 
@@ -370,29 +503,31 @@ export function installJupiterSwapCommands(
 
       await executeTxWithErrorHandling(
         () =>
-          addJupiterOnlyDirectRoutesSuggestion(
-            quoteParams,
-            (retryQuoteParams) =>
-              context.glamClient.jupiterSwap.swapV2(
-                {
-                  quoteParams: retryQuoteParams,
-                  skipQuotePriceCheck,
-                  trackingAccount,
-                },
-                context.txOptions,
-              ),
-            "swap-v2",
+          context.glamClient.jupiterSwap.swapV2(
+            { quoteParams, skipQuotePriceCheck, trackingAccount },
+            context.txOptions,
           ),
         {
           skip: options?.yes,
-          message: `Confirm swapping ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol} with jupiter_swap_v2 and quote params: ${JSON.stringify(
-            quoteParams,
-            null,
-            2,
-          )}`,
+          message: [
+            `Confirm swapping ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol} with jupiter_swap_v2 and quote params: ${JSON.stringify(
+              quoteParams,
+              null,
+              2,
+            )}`,
+            ...quoteAccountsLines(context, quoteParams),
+            // jupiter_swap_v2 skips the oracle deviation check of the quote
+            // when the flag is set and the signer's permission allows it.
+            ...(skipQuotePriceCheck
+              ? [
+                  "Oracle quote price check: skipped (--skip-quote-price-check) for a signer holding SkipQuotePriceCheck, or SkipQuotePriceCheckLimited when the output token has no oracle",
+                ]
+              : []),
+          ].join("\n"),
         },
         (txSig) =>
           `Swapped ${amount} ${tokenFrom.symbol} to ${tokenTo.symbol} with jupiter_swap_v2: ${txSig}`,
+        onlyDirectRoutesAdvice(quoteParams, "swap-v2"),
       );
     });
 }

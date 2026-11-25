@@ -1,6 +1,8 @@
 import { BN } from "@coral-xyz/anchor";
 import {
   fromUiAmount,
+  MAX_SAFE_INTEGER_BN,
+  STRATEGY_DURATION_COUNT,
   U8_MAX,
   U16_MAX,
   U32_MAX,
@@ -13,6 +15,10 @@ import fs from "fs";
 import { fail } from "./errors";
 
 export type ArrayInput = string | readonly string[] | null | undefined;
+
+// The largest values of the two signed widths a program casts an amount to.
+export const I64_MAX_BN = new BN(2).pow(new BN(63)).subn(1);
+export const I128_MAX_BN = new BN(2).pow(new BN(127)).subn(1);
 
 function labelOrValue(value: unknown, label?: string): string {
   return label ?? String(value);
@@ -157,7 +163,11 @@ export function parseCbps(value: string, label = "value"): BN {
   return new BN(parseU32(value, label));
 }
 
-/** Parse a comma- or space-separated list of duration indexes into a deduped u8[]. */
+/**
+ * Parse a comma- or space-separated list of Loopscale duration indexes into a
+ * deduped list. A strategy has one slot per index 0 to 4, and ext_loopscale
+ * allows a duration by its exact index, so a larger one allows nothing.
+ */
 export function parseDurationIndexes(raw: ArrayInput, label: string): number[] {
   const parts = parseArrayInput(raw);
   if (parts.length === 0) {
@@ -168,6 +178,11 @@ export function parseDurationIndexes(raw: ArrayInput, label: string): number[] {
   const result: number[] = [];
   for (const part of parts) {
     const index = parseU8(part, label);
+    if (index >= STRATEGY_DURATION_COUNT) {
+      fail(
+        `${label} ${index} names no Loopscale duration: the indexes are 0 (1 day), 1 (1 week), 2 (1 month), 3 (3 months) and 4 (1 year)`,
+      );
+    }
     if (!seen.has(index)) {
       seen.add(index);
       result.push(index);
@@ -176,10 +191,51 @@ export function parseDurationIndexes(raw: ArrayInput, label: string): number[] {
   return result;
 }
 
+/**
+ * A UI amount in base units is a u64 on the wire. A larger one would pass the
+ * confirmation and fail only when the instruction is encoded. `alsoTaken` is
+ * the one larger value a caller's instruction gives a meaning.
+ */
+function uiAmountToBaseUnits(
+  trimmed: string,
+  decimals: number,
+  shown: string,
+  alsoTaken?: BN,
+): BN {
+  const parsed = fromUiAmount(trimmed, decimals);
+  if (parsed.gt(U64_MAX_BN) && !(alsoTaken && parsed.eq(alsoTaken))) {
+    fail(
+      `${shown} exceeds the u64 maximum of ${U64_MAX_BN.toString()} base units`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Some amounts leave the SDK as a JavaScript number, which holds an integer
+ * exactly up to 2^53 - 1: the amount of a Jupiter quote, and every amount sent
+ * to the Loopscale API. For Loopscale the SDK refuses a larger amount only
+ * when it builds the request, after the confirmation. For a quote the
+ * conversion to a number threw a bn.js assertion.
+ */
+export function requireSafeIntegerAmount(
+  amount: BN,
+  label: string,
+  taker: string,
+): BN {
+  if (amount.gt(MAX_SAFE_INTEGER_BN)) {
+    fail(
+      `${label} exceeds ${MAX_SAFE_INTEGER_BN.toString()} base units, the most the SDK sends to ${taker}`,
+    );
+  }
+  return amount;
+}
+
 export function parsePositiveUiAmount(
   value: string,
   decimals: number,
   label?: string,
+  alsoTaken?: BN,
 ): BN {
   const trimmed = value.trim();
   if (!/^\d+(\.\d+)?$/.test(trimmed)) {
@@ -193,7 +249,12 @@ export function parsePositiveUiAmount(
     );
   }
 
-  const parsed = fromUiAmount(trimmed, decimals);
+  const parsed = uiAmountToBaseUnits(
+    trimmed,
+    decimals,
+    labelOrValue(value, label),
+    alsoTaken,
+  );
   if (parsed.isZero()) {
     fail(`${labelOrValue(value, label)} must be greater than zero`);
   }
@@ -217,7 +278,7 @@ export function parseNonNegativeUiAmount(
     );
   }
 
-  return fromUiAmount(trimmed, decimals);
+  return uiAmountToBaseUnits(trimmed, decimals, labelOrValue(value, label));
 }
 
 export function parsePositiveInteger(value: string, label?: string): number {
@@ -232,8 +293,8 @@ export function parseNonNegativeInteger(value: string, label?: string): number {
   return parseUnsignedNumber(value, labelOrValue(value, label));
 }
 
-export function parsePositiveBn(value: string, label?: string): BN {
-  const parsed = parseUnsignedBn(value, labelOrValue(value, label));
+export function parsePositiveBn(value: string, label?: string, max?: BN): BN {
+  const parsed = parseUnsignedBn(value, labelOrValue(value, label), max);
   if (parsed.isZero()) {
     fail(`${labelOrValue(value, label)} must be a positive big integer`);
   }
@@ -287,18 +348,52 @@ export function validateBooleanInput(input: string): boolean {
   );
 }
 
-export function parseHexOrBase64Bytes(value: string, label: string): Buffer {
-  const normalized = value.trim();
-  const bytes = normalized.startsWith("0x")
-    ? Buffer.from(normalized.slice(2), "hex")
-    : /^[0-9a-fA-F]+$/.test(normalized) && normalized.length % 2 === 0
-      ? Buffer.from(normalized, "hex")
-      : Buffer.from(normalized, "base64");
+const HEX_DIGITS = /^[0-9a-fA-F]*$/;
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+const BASE64_URL = /^[A-Za-z0-9_-]+={0,2}$/;
 
-  if (bytes.length === 0) {
-    throw new Error(`${label} could not be parsed as hex or base64`);
+/**
+ * Bytes written as hex, an even number of digits with or without `0x`, or as
+ * base64, standard or URL-safe, padded or not. Whitespace inside is dropped,
+ * as a pasted value can wrap. Node's decoders stop at an odd hex digit or a
+ * stray character, and read any other text as base64, so a slip in either
+ * form was sent as other bytes. A string of hex digits alone is hex.
+ */
+export function parseHexOrBase64Bytes(value: string, label: string): Buffer {
+  const compact = value.replace(/\s+/g, "");
+  const refusal = new Error(
+    `${label} must be hex (an even number of hex digits, 0x optional) or base64`,
+  );
+  const prefixed = /^0[xX]/.test(compact);
+  const digits = prefixed ? compact.slice(2) : compact;
+  if (prefixed || HEX_DIGITS.test(digits)) {
+    if (digits.length === 0 || digits.length % 2 !== 0) {
+      throw refusal;
+    }
+    if (!HEX_DIGITS.test(digits)) {
+      throw refusal;
+    }
+    return Buffer.from(digits, "hex");
   }
 
+  const encoding = BASE64.test(compact)
+    ? "base64"
+    : BASE64_URL.test(compact)
+      ? "base64url"
+      : null;
+  if (encoding === null) {
+    throw refusal;
+  }
+  const bytes = Buffer.from(compact, encoding);
+  // Node drops the bits a last character holds past the bytes; text that
+  // does not encode back to itself is not the bytes it decodes to.
+  const unpadded = (text: string) => text.replace(/=+$/, "");
+  if (
+    bytes.length === 0 ||
+    unpadded(bytes.toString(encoding)) !== unpadded(compact)
+  ) {
+    throw refusal;
+  }
   return bytes;
 }
 

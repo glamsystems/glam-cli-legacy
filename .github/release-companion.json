@@ -7,6 +7,7 @@
     "scripts/check-bundle.mjs",
     "scripts/release-cli.mjs",
     "scripts/tests/check-bundle.test.mjs",
-    "scripts/tests/release-cli.test.mjs"
+    "scripts/tests/release-cli.test.mjs",
+    "scripts/tsconfig.sdk-api.json"
   ]
 }

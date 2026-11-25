@@ -4,28 +4,131 @@ import {
   charsToString,
   GlamClient,
   StateAccountType,
+  fetchMintAndTokenProgram,
   fetchMintsAndTokenPrograms,
   PkSet,
 } from "@glamsystems/glam-sdk";
+import { BN } from "@coral-xyz/anchor";
+import { unpackAccount } from "@solana/spl-token";
 import { type Command } from "commander";
 import { PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import fs from "fs";
 import {
   type CliContext,
   executeTxWithErrorHandling,
+  formatUiAmount,
   parseMintJson,
   parseStateJson,
   printTable,
+  printableText,
+  recordSentSignatures,
   resolveTokenPublicKey,
 } from "../utils";
+import { fail } from "../errors";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  vaultTimelockOf,
+} from "../staging";
 import {
   parseArrayInput,
-  parsePositiveInteger,
   parsePositiveUiAmount,
+  parseUnsignedNumber,
   validateBooleanInput,
   validateFileExists,
   validatePublicKey,
 } from "../parsing";
+
+// web3.js reads an account's lamports into a number, which holds a count past
+// 2^53 rounded, by at most this many lamports for any u64.
+const LAMPORTS_ROUNDING = 1024;
+
+/**
+ * What the vault holds of a token, in base units. A native (wSOL) account
+ * holds every lamport above the reserve it records, as
+ * validate_asset_balance_zero in glam_protocol measures it: its token balance
+ * plus `unsynced`, the lamports no SyncNative has added to that balance.
+ * `approximate` says that `unsynced` was counted from lamports read rounded,
+ * so both figures are off by the rounding at most.
+ */
+async function vaultTokenHolding(
+  context: CliContext,
+  token: PublicKey,
+): Promise<{ held: BN; unsynced: BN; decimals: number; approximate: boolean }> {
+  const { connection } = context.glamClient;
+  const { mint, tokenProgram } = await fetchMintAndTokenProgram(
+    connection,
+    token,
+  );
+  const { decimals } = mint;
+  const ata = context.glamClient.getVaultAta(token, tokenProgram);
+  const info = await connection.getAccountInfo(ata, "confirmed");
+  // No token account: nothing at the address, or lamports sent to it before
+  // one was created, which the program reads as a zero balance too.
+  if (!info || info.data.length === 0) {
+    const none = new BN(0);
+    return { held: none, unsynced: none, decimals, approximate: false };
+  }
+  const account = unpackAccount(ata, info, tokenProgram);
+  const amount = new BN(account.amount.toString());
+  if (account.rentExemptReserve === null) {
+    return { held: amount, unsynced: new BN(0), decimals, approximate: false };
+  }
+  const above = new BN(BigInt(info.lamports).toString())
+    .sub(new BN(account.rentExemptReserve.toString()))
+    .sub(amount);
+  // Lamports below the reserve plus the token balance is a state no token
+  // program leaves; it counts as nothing unsynced. So does a difference no
+  // larger than the rounding of a u64 can make, once the lamports are rounded.
+  const rounded = !Number.isSafeInteger(info.lamports);
+  const unsynced = above.gtn(rounded ? LAMPORTS_ROUNDING : 0)
+    ? above
+    : new BN(0);
+  return {
+    held: amount.add(unsynced),
+    unsynced,
+    decimals,
+    approximate: rounded && !unsynced.isZero(),
+  };
+}
+
+/**
+ * What a removal from the asset or borrowable list does to a token the vault
+ * holds. Pricing values the vault's tokens on either list and no other, so a
+ * held token on neither drops out of the vault's value.
+ */
+async function heldTokenLine(
+  context: CliContext,
+  token: PublicKey,
+  stillListed: boolean,
+): Promise<string[]> {
+  if (stillListed) {
+    return [];
+  }
+  const { held, unsynced, decimals, approximate } = await vaultTokenHolding(
+    context,
+    token,
+  );
+  if (held.isZero()) {
+    return [];
+  }
+  const about = approximate ? "about " : "";
+  // Pricing reads a wSOL account's token balance, so it counts these lamports
+  // only once a SyncNative has added them to it.
+  const notSynced = unsynced.isZero()
+    ? ""
+    : `, ${about}${formatUiAmount(unsynced, decimals)} of that as lamports in its token account that no SyncNative has added to the token balance, which pricing counts only once one has`;
+  return [
+    `The vault holds ${about}${formatUiAmount(held, decimals)} of ${token}${notSynced}. Pricing values only the tokens on the vault allowlist or the borrowable list, so once this applies the vault's value leaves them out.`,
+  ];
+}
+
+// The most an account grows in one instruction: the runtime's
+// MAX_PERMITTED_DATA_INCREASE. extend_state refuses a byte more.
+const MAX_STATE_GROWTH_BYTES = 10_240;
+
+// MAX_SIZE_NAME in glam_protocol: a portfolio manager name is 32 bytes.
+const PORTFOLIO_MANAGER_NAME_BYTES = 32;
 
 export function installVaultCommands(program: Command, context: CliContext) {
   program
@@ -93,7 +196,7 @@ export function installVaultCommands(program: Command, context: CliContext) {
           s.idStr,
           s.vault.toBase58(),
           s.launchDate,
-          charsToString(s.name),
+          printableText(charsToString(s.name)),
         ]),
       );
     });
@@ -124,6 +227,14 @@ export function installVaultCommands(program: Command, context: CliContext) {
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Update the owner of a GLAM vault")
     .action(async (newOwner: PublicKey, options) => {
+      // stringToChars keeps the first 32 bytes, which can end inside a
+      // character, while the confirmation showed the whole name.
+      const nameBytes = Buffer.byteLength(options?.name ?? "", "utf8");
+      if (nameBytes > PORTFOLIO_MANAGER_NAME_BYTES) {
+        fail(
+          `--name must be at most ${PORTFOLIO_MANAGER_NAME_BYTES} bytes of UTF-8, the size of a portfolio manager name; it is ${nameBytes}`,
+        );
+      }
       const newPortfolioManagerName = options?.name
         ? stringToChars(options.name)
         : undefined;
@@ -131,24 +242,28 @@ export function installVaultCommands(program: Command, context: CliContext) {
       const message = newPortfolioManagerName
         ? `Confirm transferring ownership to ${newOwner} (portfolio manager: ${options.name})?`
         : `Confirm transferring ownership to ${newOwner}?`;
+      const timelock = await readVaultTimelock(context);
 
       await executeTxWithErrorHandling(
         () =>
-          context.glamClient.state.update({
-            owner: newOwner,
-            portfolioManagerName: newPortfolioManagerName,
-          }),
+          context.glamClient.state.update(
+            {
+              owner: newOwner,
+              portfolioManagerName: newPortfolioManagerName,
+            },
+            context.txOptions,
+          ),
         {
           skip: options?.yes,
-          message,
+          message: timelock.confirm(message),
         },
-        (txSig) => `Vault ownership transferred: ${txSig}`,
+        timelock.outcome("Vault ownership transferred"),
       );
     });
 
   const setEnabled = async (enabled: boolean, options: { yes: boolean }) => {
     const stateAccount = await context.glamClient.fetchStateAccount();
-    const name = charsToString(stateAccount.name);
+    const name = printableText(charsToString(stateAccount.name));
 
     await executeTxWithErrorHandling(
       () =>
@@ -158,7 +273,9 @@ export function installVaultCommands(program: Command, context: CliContext) {
         ),
       {
         skip: options?.yes,
-        message: `Confirm ${enabled ? "enabling" : "disabling"} vault: ${name}`,
+        message: vaultTimelockOf(stateAccount).confirmAtOnce(
+          `Confirm ${enabled ? "enabling" : "disabling"} vault: ${name}`,
+        ),
       },
       (txSig) =>
         `GLAM vault ${name} ${enabled ? "enabled" : "disabled"}: ${txSig}`,
@@ -237,7 +354,7 @@ export function installVaultCommands(program: Command, context: CliContext) {
           },
           {
             skip: options?.yes,
-            message: `Confirm initializing ${accountTypeStr}: ${charsToString(initStateParams.name)}`,
+            message: `Confirm initializing ${accountTypeStr}: ${printableText(charsToString(initStateParams.name))}`,
           },
           (txSig) => `Initialized ${accountTypeStr}: ${txSig}`,
         );
@@ -263,7 +380,7 @@ export function installVaultCommands(program: Command, context: CliContext) {
         },
         {
           skip: options?.yes,
-          message: `Confirm initializing ${accountTypeStr}: ${charsToString(initMintParams.name)}`,
+          message: `Confirm initializing ${accountTypeStr}: ${printableText(charsToString(initMintParams.name))}`,
         },
         (txSig) => `Initialized ${accountTypeStr}: ${txSig}`,
       );
@@ -271,14 +388,28 @@ export function installVaultCommands(program: Command, context: CliContext) {
 
   program
     .command("extend")
-    .argument("<bytes>", "New bytes", (value: string) =>
-      parsePositiveInteger(value, "bytes"),
+    .argument(
+      "<bytes>",
+      `Bytes to add, at most ${MAX_STATE_GROWTH_BYTES} in one transaction`,
+      (value: string) => {
+        // extend_state takes its byte count as a u32 and grows the account
+        // by it in one instruction, which the program refuses past the limit.
+        const bytes = parseUnsignedNumber(
+          value,
+          "bytes",
+          MAX_STATE_GROWTH_BYTES,
+        );
+        if (bytes === 0) {
+          fail("bytes must be a positive integer");
+        }
+        return bytes;
+      },
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Extend GLAM state account")
     .action(async (bytes, options) => {
       await executeTxWithErrorHandling(
-        () => context.glamClient.state.extend(bytes),
+        () => context.glamClient.state.extend(bytes, context.txOptions),
         {
           skip: options?.yes,
           message: `Confirm extending GLAM state ${context.cliConfig.glamState} by ${bytes} bytes`,
@@ -302,6 +433,7 @@ export function installVaultCommands(program: Command, context: CliContext) {
         // The same transaction version the session was started with.
         transactionVersion: context.glamClient.transactionVersion,
       });
+      recordSentSignatures(glamClient);
       const stateModel = await glamClient.fetchStateModel();
 
       const preInstructions = new Array<TransactionInstruction>();
@@ -320,9 +452,9 @@ export function installVaultCommands(program: Command, context: CliContext) {
         },
         {
           skip: options?.yes,
-          message: `Confirm closing vault: ${stateModel.nameStr}\n  - state: ${statePda}\n  - vault: ${stateModel.vault}`,
+          message: `Confirm closing vault: ${printableText(stateModel.nameStr)}\n  - state: ${statePda}\n  - vault: ${stateModel.vault}`,
         },
-        (txSig) => `${stateModel.nameStr} closed: ${txSig}`,
+        (txSig) => `${printableText(stateModel.nameStr)} closed: ${txSig}`,
       );
     });
 
@@ -374,6 +506,13 @@ export function installVaultCommands(program: Command, context: CliContext) {
     )
     .action(async (tokens: string[], options) => {
       let tokenAccountPubkeys: PublicKey[] = [];
+
+      // --empty picks the accounts itself and would drop the tokens given.
+      if (options.empty && parseArrayInput(tokens).length > 0) {
+        fail(
+          "Give token mints or --empty, not both: --empty closes every empty token account of the vault and no other",
+        );
+      }
 
       if (options.empty) {
         const vault = context.glamClient.vaultPda;
@@ -549,10 +688,14 @@ export function installVaultCommands(program: Command, context: CliContext) {
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
       const state = await context.glamClient.fetchStateAccount();
-      const assetsSet = new PkSet(state.assets);
+      const timelock = vaultTimelockOf(state);
+      const base = timelock.list("assets", state.assets);
+      const assetsSet = new PkSet(base.value);
 
       if (assetsSet.has(token)) {
-        console.error(`Token ${token} already allowlisted`);
+        console.error(
+          `Token ${token} already allowlisted${base.stagedApart ? " in the staged allowlist" : ""}`,
+        );
         process.exit(1);
       }
 
@@ -562,9 +705,16 @@ export function installVaultCommands(program: Command, context: CliContext) {
         () => context.glamClient.state.update({ assets }, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding ${token} to vault allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm adding ${token} to vault allowlist?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the vault allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `${token} added to vault allowlist: ${txSig}`,
+        timelock.outcome(`${token} added to vault allowlist`),
       );
     });
 
@@ -586,21 +736,43 @@ export function installVaultCommands(program: Command, context: CliContext) {
         process.exit(1);
       }
 
-      const assetsSet = new PkSet(state.assets);
+      const timelock = vaultTimelockOf(state);
+      const base = timelock.list("assets", state.assets);
+      const assetsSet = new PkSet(base.value);
       const removed = assetsSet.delete(token);
       if (!removed) {
-        console.error(`${token} not found in vault allowlist`);
+        console.error(
+          `${token} not found in vault allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
 
       const assets = Array.from(assetsSet);
+      const { borrowable } = await context.glamClient.fetchStateModel();
+      // The borrowable list as it will stand: a removal staged from it too
+      // left the token unpriced once both applied, with neither warning.
+      const held = await heldTokenLine(
+        context,
+        token,
+        timelock
+          .list("borrowable", borrowable ?? [])
+          .value.some((key) => key.equals(token)),
+      );
       await executeTxWithErrorHandling(
         () => context.glamClient.state.update({ assets }, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing ${token} from vault allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm removing ${token} from vault allowlist?`,
+              ...held,
+              ...(base.stagedApart
+                ? [editsStagedLine("the vault allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `${token} removed from vault allowlist: ${txSig}`,
+        timelock.outcome(`${token} removed from vault allowlist`),
       );
     });
 
@@ -614,10 +786,14 @@ export function installVaultCommands(program: Command, context: CliContext) {
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
       const stateModel = await context.glamClient.fetchStateModel();
-      const borrowableSet = new PkSet(stateModel.borrowable || []);
+      const timelock = await readVaultTimelock(context);
+      const base = timelock.list("borrowable", stateModel.borrowable || []);
+      const borrowableSet = new PkSet(base.value);
 
       if (borrowableSet.has(token)) {
-        console.error(`Token ${token} already allowlisted as borrowable`);
+        console.error(
+          `Token ${token} already allowlisted as borrowable${base.stagedApart ? " in the staged allowlist" : ""}`,
+        );
         process.exit(1);
       }
 
@@ -628,10 +804,16 @@ export function installVaultCommands(program: Command, context: CliContext) {
           context.glamClient.state.update({ borrowable }, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding ${token} to the vault's borrowable allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm adding ${token} to the vault's borrowable allowlist?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the borrowable allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `${token} added to the vault's borrowable allowlist: ${txSig}`,
+        timelock.outcome(`${token} added to the vault's borrowable allowlist`),
       );
     });
 
@@ -647,24 +829,45 @@ export function installVaultCommands(program: Command, context: CliContext) {
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
       const stateModel = await context.glamClient.fetchStateModel();
-      const borrowableSet = new PkSet(stateModel.borrowable || []);
+      const timelock = await readVaultTimelock(context);
+      const base = timelock.list("borrowable", stateModel.borrowable || []);
+      const borrowableSet = new PkSet(base.value);
       const removed = borrowableSet.delete(token);
 
       if (!removed) {
-        console.error(`${token} not found in the vault's borrowable allowlist`);
+        console.error(
+          `${token} not found in the vault's borrowable allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
 
       const borrowable = Array.from(borrowableSet);
+      // The vault allowlist as it will stand, staged removal included.
+      const held = await heldTokenLine(
+        context,
+        token,
+        timelock
+          .list("assets", stateModel.assets ?? [])
+          .value.some((key) => key.equals(token)),
+      );
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.state.update({ borrowable }, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing ${token} from the vault's borrowable allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm removing ${token} from the vault's borrowable allowlist?`,
+              ...held,
+              ...(base.stagedApart
+                ? [editsStagedLine("the borrowable allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `${token} removed from the vault's borrowable allowlist: ${txSig}`,
+        timelock.outcome(
+          `${token} removed from the vault's borrowable allowlist`,
+        ),
       );
     });
 

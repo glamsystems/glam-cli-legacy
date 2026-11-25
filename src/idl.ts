@@ -28,7 +28,9 @@ const MAX_IDL_BYTES = 16 * 1024 * 1024;
  * is strictly more defensive, and a mismatch degrades to null and the program-metadata
  * fallback.
  */
-const LEGACY_IDL_DISCRIMINATOR = Buffer.from([24, 70, 98, 191, 58, 144, 123, 158]);
+const LEGACY_IDL_DISCRIMINATOR = Buffer.from([
+  24, 70, 98, 191, 58, 144, 123, 158,
+]);
 
 const IDL_SEED = (() => {
   const seed = Buffer.alloc(16);
@@ -194,15 +196,14 @@ const fetchLegacyIdl = async (glamClient: GlamClient): Promise<any | null> => {
 };
 
 /** Reads the IDL JSON from the canonical program-metadata account, or null. */
-const fetchMetadataIdl = async (glamClient: GlamClient): Promise<any | null> => {
+const fetchMetadataIdl = async (
+  glamClient: GlamClient,
+): Promise<any | null> => {
   const programId = glamClient.protocolProgram.programId;
   const accountInfo = await glamClient.provider.connection.getAccountInfo(
     metadataIdlPda(programId),
   );
-  if (
-    !accountInfo ||
-    !accountInfo.owner.equals(PROGRAM_METADATA_PROGRAM_ID)
-  ) {
+  if (!accountInfo || !accountInfo.owner.equals(PROGRAM_METADATA_PROGRAM_ID)) {
     return null;
   }
   return decodeMetadataIdl(accountInfo.data, programId);

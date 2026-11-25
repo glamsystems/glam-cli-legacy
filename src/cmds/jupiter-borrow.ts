@@ -1,4 +1,8 @@
-import { JupiterBorrowPolicy } from "@glamsystems/glam-sdk";
+import { BN } from "@coral-xyz/anchor";
+import {
+  JUPITER_BORROW_PROTOCOL,
+  JupiterBorrowPolicy,
+} from "@glamsystems/glam-sdk";
 import { PublicKey } from "@solana/web3.js";
 import { type Command } from "commander";
 
@@ -11,10 +15,29 @@ import {
   resolveTokenPublicKey,
 } from "../utils";
 import {
-  parseNonNegativeInteger,
-  parsePositiveUiAmount,
-  validatePublicKey,
-} from "../parsing";
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import { parsePositiveUiAmount, parseU16, validatePublicKey } from "../parsing";
+
+// Jupiter reads i128::MIN as the whole collateral or the whole debt, and the
+// SDK negates the amount of a withdraw or a repay. So 2^127 base units asks
+// for all of it: the one amount past u64::MAX those two actions take.
+const WHOLE_POSITION = new BN(2).pow(new BN(127));
+
+/** The Jupiter Lend borrow policy an edit replaces: the staged one under a timelock that holds one. */
+async function jupiterBorrowPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.jupiterBorrow.fetchPolicy(),
+    () => context.glamClient.extJupiterProgram.programId,
+    JUPITER_BORROW_PROTOCOL,
+    JupiterBorrowPolicy.decode,
+  );
+}
 
 export function installJupiterBorrowCommands(
   borrowProgram: Command,
@@ -62,7 +85,7 @@ export function installJupiterBorrowCommands(
     .option(
       "--vault-id <vault-id>",
       "Only list positions for this Jupiter vault_id",
-      (value: string) => parseNonNegativeInteger(value, "vault-id"),
+      (value: string) => parseU16(value, "vault-id"),
     )
     .description("List Jupiter Lend borrow positions held by the GLAM vault")
     .action(async (options: { vaultId?: number }) => {
@@ -97,11 +120,13 @@ export function installJupiterBorrowCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a borrow vault to the allowlist")
     .action(async (vault: PublicKey, options: { yes?: boolean }) => {
-      const policy =
-        (await context.glamClient.jupiterBorrow.fetchPolicy()) ??
-        new JupiterBorrowPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new JupiterBorrowPolicy([], [], []);
       if (policy.vaultsAllowlist.find((v) => v.equals(vault))) {
-        console.error(`Vault ${vault} is already in the borrow allowlist`);
+        console.error(
+          `Vault ${vault} is already in the borrow allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
       policy.vaultsAllowlist.push(vault);
@@ -110,9 +135,16 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm adding vault ${vault} to Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding vault ${vault} to Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Vault ${vault} added to borrow allowlist: ${txSig}`,
+        timelock.outcome(`Vault ${vault} added to borrow allowlist`),
       );
     });
 
@@ -126,13 +158,19 @@ export function installJupiterBorrowCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove a borrow vault from the allowlist")
     .action(async (vault: PublicKey, options: { yes?: boolean }) => {
-      const policy = await context.glamClient.jupiterBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.vaultsAllowlist.find((v) => v.equals(vault))) {
-        console.error("Vault not in borrow allowlist. Removal not needed.");
+        console.error(
+          `Vault not in borrow allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
         process.exit(1);
       }
       policy.vaultsAllowlist = policy.vaultsAllowlist.filter(
@@ -143,9 +181,16 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm removing vault ${vault} from Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing vault ${vault} from Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Vault ${vault} removed from borrow allowlist: ${txSig}`,
+        timelock.outcome(`Vault ${vault} removed from borrow allowlist`),
       );
     });
 
@@ -156,9 +201,9 @@ export function installJupiterBorrowCommands(
     .description("Add a collateral token to the borrow allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.jupiterBorrow.fetchPolicy()) ??
-        new JupiterBorrowPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new JupiterBorrowPolicy([], [], []);
       if (policy.collateralMintsAllowlist.find((m) => m.equals(token))) {
         console.error(
           `Collateral token ${token} is already in the borrow allowlist`,
@@ -171,10 +216,16 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm adding collateral token ${token} to Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding collateral token ${token} to Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Collateral token ${token} added to borrow allowlist: ${txSig}`,
+        timelock.outcome(`Collateral token ${token} added to borrow allowlist`),
       );
     });
 
@@ -185,9 +236,13 @@ export function installJupiterBorrowCommands(
     .description("Remove a collateral token from the borrow allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.jupiterBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.collateralMintsAllowlist.find((m) => m.equals(token))) {
@@ -204,10 +259,18 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm removing collateral token ${token} from Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing collateral token ${token} from Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Collateral token ${token} removed from borrow allowlist: ${txSig}`,
+        timelock.outcome(
+          `Collateral token ${token} removed from borrow allowlist`,
+        ),
       );
     });
 
@@ -219,9 +282,9 @@ export function installJupiterBorrowCommands(
     .description("Add a borrowable debt token to the allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.jupiterBorrow.fetchPolicy()) ??
-        new JupiterBorrowPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value ?? new JupiterBorrowPolicy([], [], []);
       if (policy.borrowMintsAllowlist.find((m) => m.equals(token))) {
         console.error(
           `Borrow token ${token} is already in the borrow allowlist`,
@@ -234,9 +297,16 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm adding borrow token ${token} to Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding borrow token ${token} to Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Borrow token ${token} added to borrow allowlist: ${txSig}`,
+        timelock.outcome(`Borrow token ${token} added to borrow allowlist`),
       );
     });
 
@@ -248,9 +318,13 @@ export function installJupiterBorrowCommands(
     .description("Remove a borrowable debt token from the allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.jupiterBorrow.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterBorrowPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.borrowMintsAllowlist.find((m) => m.equals(token))) {
@@ -267,10 +341,16 @@ export function installJupiterBorrowCommands(
           context.glamClient.jupiterBorrow.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm removing borrow token ${token} from Jupiter Lend borrow allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing borrow token ${token} from Jupiter Lend borrow allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Lend borrow allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Borrow token ${token} removed from borrow allowlist: ${txSig}`,
+        timelock.outcome(`Borrow token ${token} removed from borrow allowlist`),
       );
     });
 
@@ -279,7 +359,7 @@ export function installJupiterBorrowCommands(
     .requiredOption(
       "--vault-id <vault-id>",
       "Jupiter Vaults vault ID",
-      (value: string) => parseNonNegativeInteger(value, "vault-id"),
+      (value: string) => parseU16(value, "vault-id"),
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Initialize a Jupiter Lend borrow position")
@@ -318,7 +398,12 @@ export function installJupiterBorrowCommands(
       context.glamClient,
       tokenMint.toBase58(),
     );
-    const amountBN = parsePositiveUiAmount(amount, token.decimals, "amount");
+    const amountBN = parsePositiveUiAmount(
+      amount,
+      token.decimals,
+      "amount",
+      action === "withdraw" || action === "repay" ? WHOLE_POSITION : undefined,
+    );
 
     const sdk = context.glamClient.jupiterBorrow;
     const send = () => {
@@ -342,7 +427,9 @@ export function installJupiterBorrowCommands(
           `Confirm Jupiter Lend borrow ${action}`,
           `position: ${position}`,
           `vault_id: ${vault.vaultId}`,
-          `amount: ${amount} ${token.symbol}`,
+          amountBN.eq(WHOLE_POSITION)
+            ? `amount: the whole ${isCollateralSide ? "collateral" : "debt"} (${amount} ${token.symbol})`
+            : `amount: ${amount} ${token.symbol}`,
         ].join("\n"),
       },
       (txSig) =>

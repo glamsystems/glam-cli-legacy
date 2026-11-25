@@ -21,6 +21,10 @@ them in `.github/release-companion.json`.
 - `scripts/check-bundle.mjs` is the bundle check. The pack mode runs it on the
   tarball it packs, and the private controller runs it in the release
   snapshot and on every pull request that changes the CLI.
+- `scripts/tsconfig.sdk-api.json` is the config of the SDK API check. With it
+  the private controller type-checks `src/` against the installed
+  `@glamsystems/glam-sdk`, in the release snapshot and on every pull request
+  that changes the CLI. The publish workflow does not run it.
 
 The controller reads `.cli-release.json` (version, private source commit,
 notes) from the tagged commit and expects the GitHub Release body to end with

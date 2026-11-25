@@ -16,6 +16,7 @@ import {
   PHOENIX_DEFAULT_TRADER_RENT_SOL,
   PHOENIX_MAX_POSITIONS,
   PHOENIX_MIN_MAX_POSITIONS,
+  PHOENIX_PROTOCOL,
   PhoenixOnboardingError,
   type PhoenixBaseLots,
   type PhoenixOnboardTraderResult,
@@ -29,6 +30,7 @@ import {
   type PhoenixTraderOnboardingStatus,
   PhoenixPolicy,
   U64_MAX_BIGINT,
+  U64_MAX_BN,
   fetchMintAndTokenProgram,
   formatLamportsAsSol,
   getPhoenixTraderAccountSize,
@@ -47,16 +49,23 @@ import {
   type CliContext,
   confirmOperation,
   executeTxWithErrorHandling,
+  formatUiAmount,
   parseTxError,
   printTable,
 } from "../utils";
 import { fail } from "../errors";
 import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import {
   collectArrayValues,
   parseArrayInput,
   parseInteger,
-  parseNonNegativeUiAmount,
   parseOptionalU64,
+  parsePositiveBn,
+  parsePositiveUiAmount,
   parseU8,
   parseU32,
   parseU64,
@@ -111,6 +120,19 @@ function addTraderOptions(command: Command): Command {
     .option("--subaccount-index <index>", "Phoenix subaccount index", "0");
 }
 
+/**
+ * What --cancel-existing adds to an order's confirmation. The pinned Phoenix
+ * SDK documents the flag as cancelling resting orders, rather than rejecting
+ * the order, when its margin check fails, and names no client order id.
+ */
+function cancelExistingNote(options: { cancelExisting?: boolean }): string[] {
+  return options.cancelExisting
+    ? [
+        "cancelling resting orders rather than rejecting it if it fails Phoenix's margin check (--cancel-existing)",
+      ]
+    : [];
+}
+
 function addOrderOptions(command: Command): Command {
   return addTraderOptions(command)
     .option(
@@ -133,7 +155,7 @@ function addOrderOptions(command: Command): Command {
     .option("--reduce-only", "Submit a reduce-only order", false)
     .option(
       "--cancel-existing",
-      "Cancel existing matching client order id",
+      "If the order fails Phoenix's margin check, cancel resting orders rather than reject it",
       false,
     )
     .option("-y, --yes", "Skip confirmation prompt", false);
@@ -144,14 +166,6 @@ function bigintToBN(value: bigint, label: string, max = U64_MAX_BIGINT): BN {
     fail(`${label} exceeds ${max.toString()}`);
   }
   return new BN(value.toString());
-}
-
-function formatUiAmount(amount: BN, decimals: number): string {
-  const scale = new BN(10).pow(new BN(decimals));
-  const whole = amount.div(scale).toString();
-  const fraction = amount.mod(scale).toString().padStart(decimals, "0");
-  const trimmedFraction = fraction.replace(/0+$/, "");
-  return trimmedFraction ? `${whole}.${trimmedFraction}` : whole;
 }
 
 function parseDecimal(
@@ -176,19 +190,42 @@ function pow10(exponent: number): bigint {
   return 10n ** BigInt(exponent);
 }
 
+/**
+ * Which way a bound goes to the market's grid: down for one that caps (a
+ * buy's price, an order's size), up for one that sets a floor (a sell's
+ * price, a minimum fill). Prices are whole ticks and fills whole lots, so
+ * either way the bound admits the same orders as the value given.
+ */
+type Rounding = "down" | "up";
+
+/** `numerator / denominator` rounded the way given. */
+function divide(numerator: bigint, denominator: bigint, rounding: Rounding) {
+  return rounding === "down"
+    ? numerator / denominator
+    : (numerator + denominator - 1n) / denominator;
+}
+
+/** A buy caps its price and a sell sets a floor under it. */
+function priceRounding(side: number): Rounding {
+  return side === ORDER_SIDE_BID ? "down" : "up";
+}
+
 function priceUsdToTicks(
   market: ExchangeMarketSnapshot,
   value: string,
   label: string,
+  rounding: Rounding,
 ): BN {
   const { numerator, scale } = parseDecimal(value, label);
-  const priceMicros = (numerator * MICRO_USD) / scale;
+  // A tick is tickSize * 10^baseLotsDecimals micro-USD. The price is scaled
+  // before the one division, so no digit is dropped on the way.
   const tickSize = BigInt(market.tickSize);
   const decimals = market.baseLotsDecimals;
-  const ticks =
-    decimals >= 0
-      ? priceMicros / (tickSize * pow10(decimals))
-      : (priceMicros * pow10(Math.abs(decimals))) / tickSize;
+  const ticks = divide(
+    numerator * MICRO_USD * pow10(Math.max(-decimals, 0)),
+    scale * tickSize * pow10(Math.max(decimals, 0)),
+    rounding,
+  );
 
   if (ticks === 0n) {
     fail(`${label} rounds down to zero ticks for ${market.symbol}`);
@@ -248,18 +285,52 @@ function baseUnitsToBaseLots(
   market: ExchangeMarketSnapshot,
   value: string,
   label: string,
+  rounding: Rounding,
 ): BN {
   const { numerator, scale } = parseDecimal(value, label);
   const decimals = market.baseLotsDecimals;
-  const lots =
-    decimals >= 0
-      ? (numerator * pow10(decimals)) / scale
-      : numerator / (scale * pow10(Math.abs(decimals)));
+  const lots = divide(
+    numerator * pow10(Math.max(decimals, 0)),
+    scale * pow10(Math.max(-decimals, 0)),
+    rounding,
+  );
 
   if (lots === 0n) {
     fail(`${label} rounds down to zero base lots for ${market.symbol}`);
   }
   return bigintToBN(lots, label);
+}
+
+/** `value / 10^exponent` as a decimal; a negative exponent multiplies. */
+function formatScaled(value: bigint, exponent: number): string {
+  if (exponent <= 0) {
+    return (value * pow10(-exponent)).toString();
+  }
+  const scale = pow10(exponent);
+  const fraction = (value % scale)
+    .toString()
+    .padStart(exponent, "0")
+    .replace(/0+$/, "");
+  const whole = (value / scale).toString();
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+/** The UI base amount of `lots`. */
+function baseLotsToBaseUnits(market: ExchangeMarketSnapshot, lots: BN): string {
+  return formatScaled(BigInt(lots.toString()), market.baseLotsDecimals);
+}
+
+/** The USD price of `ticks`. */
+function ticksToPriceUsd(market: ExchangeMarketSnapshot, ticks: BN): string {
+  // A tick is tickSize * 10^baseLotsDecimals micro-USD.
+  return formatScaled(
+    BigInt(ticks.toString()) * BigInt(market.tickSize),
+    6 - market.baseLotsDecimals,
+  );
+}
+
+function sideName(side: number): string {
+  return side === ORDER_SIDE_BID ? "bid" : "ask";
 }
 
 function parseSide(value: string): number {
@@ -571,6 +642,17 @@ function traderArgs(options: TraderOptions): {
   };
 }
 
+// The SDK builds a deposit and a withdrawal for trader 0, subaccount 0 and
+// takes no index, so another one would move that trader's collateral.
+function requireDefaultTrader(command: string, options: TraderOptions): void {
+  const { traderPdaIndex, subaccountIndex } = traderArgs(options);
+  if (traderPdaIndex !== 0 || subaccountIndex !== 0) {
+    fail(
+      `phoenix ${command} moves the collateral of trader 0, subaccount 0 only; --trader-pda-index and --subaccount-index must be 0`,
+    );
+  }
+}
+
 async function fetchConfiguredTraderState(
   context: CliContext,
   options: TraderOptions,
@@ -709,6 +791,93 @@ async function fetchVaultTokenBalance(
     }
     throw error;
   }
+}
+
+/**
+ * What ext_phoenix's check_order refuses of a placement, read from the vault's
+ * live Phoenix policy: no policy, a market off its allowlist, an order type it
+ * does not allow, and an order without the reduce-only flag where it
+ * requires one.
+ */
+async function requireOrderPolicy(
+  context: CliContext,
+  market: ExchangeMarketSnapshot,
+  orderType: number,
+  reduceOnly: boolean,
+): Promise<void> {
+  const policy = await context.glamClient.phoenix.fetchPolicy();
+  if (!policy) {
+    fail(
+      "A Phoenix order requires the vault's Phoenix policy, and the vault has none; phoenix allowlist-market and phoenix set-order-types set one",
+    );
+  }
+  const marketKey = new PublicKey(market.marketPubkey);
+  if (!policy.marketsAllowlist.some((key) => key.equals(marketKey))) {
+    fail(
+      `A Phoenix order requires its market on the vault's Phoenix allowlist, and ${market.symbol} (${marketKey}) is not on it; add it with phoenix allowlist-market ${market.symbol}`,
+    );
+  }
+  if (!policy.allowedOrderTypes.includes(orderType)) {
+    fail(
+      `The vault's Phoenix policy allows ${policy.allowedOrderTypes.length > 0 ? `${orderTypesToString(policy.allowedOrderTypes)} orders` : "no order type"}, not ${orderTypesToString([orderType])} orders; phoenix set-order-types changes that`,
+    );
+  }
+  if (policy.requireReduceOnlyOrders && !reduceOnly) {
+    fail(
+      "The vault's Phoenix policy requires reduce-only orders: pass --reduce-only",
+    );
+  }
+}
+
+/**
+ * The trader a command acts for, which its indexes pick: named when they are
+ * not the default 0/0, or always where the command names no market.
+ */
+async function traderNote(
+  context: CliContext,
+  options: TraderOptions,
+  always = false,
+): Promise<string[]> {
+  const { traderPdaIndex, subaccountIndex } = traderArgs(options);
+  if (!always && traderPdaIndex === 0 && subaccountIndex === 0) {
+    return [];
+  }
+  const trader = await context.glamClient.phoenix.getTraderPda(
+    traderPdaIndex,
+    subaccountIndex,
+  );
+  return [
+    `for trader ${trader} (trader ${traderPdaIndex}, subaccount ${subaccountIndex})`,
+  ];
+}
+
+/** Quote lots in USD: a quote lot is a micro-USD, as the prices are. */
+function quoteLotsUsd(lots: BN): string {
+  return `${formatScaled(BigInt(lots.toString()), 6)} USD (${lots} quote lot${lots.eqn(1) ? "" : "s"})`;
+}
+
+/** A last valid slot of 0 has passed on every cluster. */
+function parseLastValidSlot(value: string | undefined): BN | null {
+  const slot = parseOptionalU64(value, "last valid slot");
+  if (slot?.isZero()) {
+    fail(
+      "--last-valid-slot 0 has passed on every cluster, so the order would be invalid before it is placed; leave the option out for an order without expiry",
+    );
+  }
+  return slot;
+}
+
+/** The Phoenix policy an edit replaces: the staged one under a timelock that holds one. */
+async function phoenixPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.phoenix.fetchPolicy(),
+    () => context.glamClient.phoenix.programId,
+    PHOENIX_PROTOCOL,
+    PhoenixPolicy.decode,
+  );
 }
 
 function printPhoenixPolicy(policy: PhoenixPolicy | null) {
@@ -1043,14 +1212,16 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
       const market = resolveMarket(snapshot, marketInput);
       const marketPubkey = new PublicKey(market.marketPubkey);
 
-      const policy =
-        (await context.glamClient.phoenix.fetchPolicy()) ??
-        new PhoenixPolicy([], [], false, 0, 0);
+      const timelock = await readVaultTimelock(context);
+      const base = await phoenixPolicyToEdit(context, timelock);
+      const policy = base.value ?? new PhoenixPolicy([], [], false, 0, 0);
 
       if (
         policy.marketsAllowlist.find((allowed) => allowed.equals(marketPubkey))
       ) {
-        fail(`Phoenix market ${market.symbol} is already in the allowlist`);
+        fail(
+          `Phoenix market ${market.symbol} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.marketsAllowlist = uniquePublicKeys([
@@ -1065,9 +1236,16 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
         () => context.glamClient.phoenix.setPolicy(policy, context.txOptions),
         {
           skip: !!options.yes,
-          message: `Allowlist Phoenix market ${market.symbol} (${marketPubkey})?`,
+          message: timelock.confirm(
+            [
+              `Allowlist Phoenix market ${market.symbol} (${marketPubkey})?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Phoenix policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Allowlisted Phoenix market ${market.symbol}: ${txSig}`,
+        timelock.outcome(`Allowlisted Phoenix market ${market.symbol}`),
       );
     });
 
@@ -1083,9 +1261,9 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
     )
     .action(async (types: string, options: TxOptions) => {
       const allowedOrderTypes = parseAllowedOrderTypes(types);
-      const policy =
-        (await context.glamClient.phoenix.fetchPolicy()) ??
-        new PhoenixPolicy([], [], false, 0, 0);
+      const timelock = await readVaultTimelock(context);
+      const base = await phoenixPolicyToEdit(context, timelock);
+      const policy = base.value ?? new PhoenixPolicy([], [], false, 0, 0);
 
       policy.allowedOrderTypes = allowedOrderTypes;
 
@@ -1093,11 +1271,18 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
         () => context.glamClient.phoenix.setPolicy(policy, context.txOptions),
         {
           skip: !!options.yes,
-          message: `Set Phoenix allowed order types to ${orderTypesToString(
-            allowedOrderTypes,
-          )}?`,
+          message: timelock.confirm(
+            [
+              `Set Phoenix allowed order types to ${orderTypesToString(
+                allowedOrderTypes,
+              )}?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Phoenix policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Set Phoenix allowed order types: ${txSig}`,
+        timelock.outcome("Set Phoenix allowed order types"),
       );
     });
 
@@ -1198,18 +1383,19 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           traderPdaIndex,
           subaccountIndex,
         );
+        const maxPositions = parseInteger(
+          options.maxPositions,
+          "max positions",
+          PHOENIX_MIN_MAX_POSITIONS,
+          PHOENIX_MAX_POSITIONS,
+        );
         const params = {
-          maxPositions: new BN(
-            parseInteger(
-              options.maxPositions,
-              "max positions",
-              PHOENIX_MIN_MAX_POSITIONS,
-              PHOENIX_MAX_POSITIONS,
-            ),
-          ),
+          maxPositions: new BN(maxPositions),
           traderPdaIndex,
           traderSubaccountIndex: subaccountIndex,
         };
+        // The configured signer pays the trader account Phoenix creates.
+        const rentSol = await getPhoenixTraderRentSol(context, maxPositions);
 
         await executeTxWithErrorHandling(
           () =>
@@ -1220,7 +1406,7 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Register Phoenix trader ${traderAccount}?`,
+            message: `Register Phoenix trader ${traderAccount} (trader ${traderPdaIndex}, subaccount ${subaccountIndex}) with ${maxPositions} positions? The configured signer will fund ${rentSol} SOL of trader-account rent plus transaction fees.`,
           },
           (txSig) => `Registered Phoenix trader ${traderAccount}: ${txSig}`,
         );
@@ -1251,7 +1437,9 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           ),
         {
           skip: !!options.yes,
-          message: "Update Phoenix trader state?",
+          message: `Update Phoenix trader state ${(
+            await traderNote(context, options, true)
+          ).join("")}?`,
         },
         (txSig) => `Updated Phoenix trader state: ${txSig}`,
       );
@@ -1267,7 +1455,8 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
       "Convert USDC through Ember and deposit collateral into Phoenix",
     )
     .action(async (amount: string, options: TraderOptions & TxOptions) => {
-      const amountBN = parseNonNegativeUiAmount(amount, 6, "amount");
+      requireDefaultTrader("deposit", options);
+      const amountBN = parsePositiveUiAmount(amount, 6, "amount");
 
       await executeTxWithErrorHandling(
         () => context.glamClient.phoenix.deposit(amountBN, context.txOptions),
@@ -1287,6 +1476,7 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
   )
     .description("Withdraw Phoenix collateral to USDC")
     .action(async (amount: string, options: TraderOptions & TxOptions) => {
+      requireDefaultTrader("withdraw", options);
       const snapshot = await context.glamClient.phoenix.rise.api
         .exchange()
         .getSnapshot();
@@ -1302,9 +1492,10 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
         );
       }
 
-      const amountBN = parseNonNegativeUiAmount(
+      const amountBN = parsePositiveUiAmount(
         amount,
         canonicalMintAccount.decimals,
+        "amount",
       );
       await executeTxWithErrorHandling(
         () => context.glamClient.phoenix.withdraw(amountBN, context.txOptions),
@@ -1340,30 +1531,29 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           .exchange()
           .getSnapshot();
         const market = resolveMarket(snapshot, marketInput);
+        const orderSide = parseSide(side);
         const priceInTicks = options.priceTicks
-          ? parseU64(price, "price")
-          : priceUsdToTicks(market, price, "price");
+          ? parsePositiveBn(price, "price", U64_MAX_BN)
+          : priceUsdToTicks(market, price, "price", priceRounding(orderSide));
+        const numBaseLots = options.baseLots
+          ? parsePositiveBn(baseUnits, "base lots", U64_MAX_BN)
+          : baseUnitsToBaseLots(market, baseUnits, "base units", "down");
+        const clientOrderId = parseU128(
+          options.clientOrderId,
+          "client order id",
+        );
         const packet: PhoenixOrderPacket = {
           kind: {
             limit: {
-              side: sideKind(parseSide(side)),
+              side: sideKind(orderSide),
               priceInTicks: ticks(priceInTicks),
-              numBaseLots: baseLots(
-                options.baseLots
-                  ? parseU64(baseUnits, "base lots")
-                  : baseUnitsToBaseLots(market, baseUnits, "base units"),
-              ),
+              numBaseLots: baseLots(numBaseLots),
               selfTradeBehavior: selfTradeBehaviorKind(
                 parseSelfTradeBehavior(options.selfTradeBehavior, 1),
               ),
               matchLimit: parseOptionalU64(options.matchLimit, "match limit"),
-              clientOrderId: u128LeBytes(
-                parseU128(options.clientOrderId, "client order id"),
-              ),
-              lastValidSlot: parseOptionalU64(
-                options.lastValidSlot,
-                "last valid slot",
-              ),
+              clientOrderId: u128LeBytes(clientOrderId),
+              lastValidSlot: parseLastValidSlot(options.lastValidSlot),
               orderFlags: orderFlags(
                 options.reduceOnly ? ORDER_FLAG_REDUCE_ONLY : ORDER_FLAG_NONE,
               ),
@@ -1372,6 +1562,12 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           },
         };
 
+        await requireOrderPolicy(
+          context,
+          market,
+          PHOENIX_ORDER_PACKET_KIND_LIMIT,
+          !!options.reduceOnly,
+        );
         const remainingAccounts =
           await context.glamClient.phoenix.getMarketRemainingAccounts(
             snapshot,
@@ -1388,7 +1584,14 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Place ${market.symbol} limit order?`,
+            // The price and the size go to the grid on their stricter side,
+            // so the order is shown as it is sent.
+            message: `Place ${market.symbol} limit ${sideName(orderSide)} of ${[
+              `${baseLotsToBaseUnits(market, numBaseLots)} (${numBaseLots} base lots) at ${ticksToPriceUsd(market, priceInTicks)} USD (${priceInTicks} ticks)`,
+              ...(options.reduceOnly ? ["reduce-only"] : []),
+              ...cancelExistingNote(options),
+              ...(await traderNote(context, options)),
+            ].join(", ")}?`,
           },
           (txSig) => `Placed Phoenix limit order: ${txSig}`,
         );
@@ -1426,53 +1629,100 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
         baseUnits: string,
         options: MarketOrderOptions,
       ) => {
+        // The order options are shared with place-limit, whose price is an
+        // argument. This command's price is --price-limit.
+        if (options.priceTicks) {
+          fail(
+            "place-market has no price argument; use --price-limit-ticks to give --price-limit in raw ticks",
+          );
+        }
+        // The switch says only how --price-limit is read. Alone it set no
+        // limit, and the order went out with no price bound.
+        if (options.priceLimitTicks && options.priceLimit === undefined) {
+          fail(
+            "--price-limit-ticks reads --price-limit as raw ticks, and no --price-limit was given; give --price-limit, or neither for an order with no price limit",
+          );
+        }
+        if (
+          options.minBaseLots !== undefined &&
+          options.minBaseUnits !== undefined
+        ) {
+          fail("Give --min-base-lots or --min-base-units, not both");
+        }
+
         const snapshot = await context.glamClient.phoenix.rise.api
           .exchange()
           .getSnapshot();
         const market = resolveMarket(snapshot, marketInput);
+        const orderSide = parseSide(side);
         const numBaseLots = options.baseLots
-          ? parseU64(baseUnits, "base lots")
-          : baseUnitsToBaseLots(market, baseUnits, "base units");
-        const priceLimitTicks = options.priceLimit
-          ? options.priceLimitTicks
-            ? parseU64(options.priceLimit, "price limit")
-            : priceUsdToTicks(market, options.priceLimit, "price limit")
-          : null;
-        const minBaseLotsToFill = options.minBaseLots
-          ? parseU64(options.minBaseLots, "minimum base lots")
-          : options.minBaseUnits
-            ? baseUnitsToBaseLots(
-                market,
-                options.minBaseUnits,
-                "minimum base units",
-              )
-            : numBaseLots;
+          ? parsePositiveBn(baseUnits, "base lots", U64_MAX_BN)
+          : baseUnitsToBaseLots(market, baseUnits, "base units", "down");
+        // An option given with an empty value is read, and refused, like any
+        // other value: it is not the same as an option left out.
+        const priceLimitTicks =
+          options.priceLimit !== undefined
+            ? options.priceLimitTicks
+              ? parsePositiveBn(options.priceLimit, "price limit", U64_MAX_BN)
+              : priceUsdToTicks(
+                  market,
+                  options.priceLimit,
+                  "price limit",
+                  priceRounding(orderSide),
+                )
+            : null;
+        // A minimum of 0 lots asks for no minimum. A minimum in base units
+        // rounds up: a fill of whole lots meets it only from the next lot.
+        const minBaseLotsToFill =
+          options.minBaseLots !== undefined
+            ? parseU64(options.minBaseLots, "minimum base lots")
+            : options.minBaseUnits !== undefined
+              ? baseUnitsToBaseLots(
+                  market,
+                  options.minBaseUnits,
+                  "minimum base units",
+                  "up",
+                )
+              : numBaseLots;
+        if (minBaseLotsToFill.gt(numBaseLots)) {
+          fail(
+            `minimum base lots ${minBaseLotsToFill} exceeds the order size of ${numBaseLots} base lots, so no fill could meet it`,
+          );
+        }
+        const numQuoteLots =
+          options.quoteLots !== undefined
+            ? parsePositiveBn(options.quoteLots, "quote lots", U64_MAX_BN)
+            : null;
+        const minQuoteLotsToFill = parseU64(
+          options.minQuoteLots ?? "1",
+          "minimum quote lots",
+        );
+        // --quote-lots is the most quote the order trades, so a minimum above
+        // it asks for a fill the order cannot make.
+        if (numQuoteLots !== null && minQuoteLotsToFill.gt(numQuoteLots)) {
+          fail(
+            `minimum quote lots ${minQuoteLotsToFill} exceeds the order's ${numQuoteLots} quote lots, so no fill could meet it`,
+          );
+        }
+        const clientOrderId = parseU128(
+          options.clientOrderId,
+          "client order id",
+        );
         const packet: PhoenixOrderPacket = {
           kind: {
             immediateOrCancel: {
-              side: sideKind(parseSide(side)),
+              side: sideKind(orderSide),
               priceInTicks: optionalTicks(priceLimitTicks),
               numBaseLots: baseLots(numBaseLots),
-              numQuoteLots: optionalQuoteLots(
-                options.quoteLots
-                  ? parseU64(options.quoteLots, "quote lots")
-                  : null,
-              ),
+              numQuoteLots: optionalQuoteLots(numQuoteLots),
               minBaseLotsToFill: baseLots(minBaseLotsToFill),
-              minQuoteLotsToFill: quoteLots(
-                parseU64(options.minQuoteLots ?? "1", "minimum quote lots"),
-              ),
+              minQuoteLotsToFill: quoteLots(minQuoteLotsToFill),
               selfTradeBehavior: selfTradeBehaviorKind(
                 parseSelfTradeBehavior(options.selfTradeBehavior, 0),
               ),
               matchLimit: parseOptionalU64(options.matchLimit, "match limit"),
-              clientOrderId: u128LeBytes(
-                parseU128(options.clientOrderId, "client order id"),
-              ),
-              lastValidSlot: parseOptionalU64(
-                options.lastValidSlot,
-                "last valid slot",
-              ),
+              clientOrderId: u128LeBytes(clientOrderId),
+              lastValidSlot: parseLastValidSlot(options.lastValidSlot),
               orderFlags: orderFlags(
                 options.reduceOnly ? ORDER_FLAG_REDUCE_ONLY : ORDER_FLAG_NONE,
               ),
@@ -1481,6 +1731,12 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           },
         };
 
+        await requireOrderPolicy(
+          context,
+          market,
+          PHOENIX_ORDER_PACKET_KIND_IMMEDIATE_OR_CANCEL,
+          !!options.reduceOnly,
+        );
         const remainingAccounts =
           await context.glamClient.phoenix.getMarketRemainingAccounts(
             snapshot,
@@ -1497,7 +1753,20 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Place ${market.symbol} market order?`,
+            message: `Place ${market.symbol} market ${sideName(orderSide)} of ${[
+              `${baseLotsToBaseUnits(market, numBaseLots)} (${numBaseLots} base lots)`,
+              priceLimitTicks === null
+                ? "no price limit"
+                : `price limit ${ticksToPriceUsd(market, priceLimitTicks)} USD (${priceLimitTicks} ticks)`,
+              ...(numQuoteLots === null
+                ? []
+                : [`quote budget ${quoteLotsUsd(numQuoteLots)}`]),
+              `min base lots ${minBaseLotsToFill}`,
+              `min quote fill ${quoteLotsUsd(minQuoteLotsToFill)}`,
+              ...(options.reduceOnly ? ["reduce-only"] : []),
+              ...cancelExistingNote(options),
+              ...(await traderNote(context, options)),
+            ].join(", ")}?`,
           },
           (txSig) => `Placed Phoenix market order: ${txSig}`,
         );
@@ -1531,7 +1800,11 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           ),
         {
           skip: !!options.yes,
-          message: `Cancel all ${market.symbol} Phoenix orders?`,
+          message: `Cancel all ${market.symbol} Phoenix orders${(
+            await traderNote(context, options)
+          )
+            .map((note) => ` ${note}`)
+            .join("")}?`,
         },
         (txSig) => `Cancelled Phoenix orders: ${txSig}`,
       );
@@ -1559,6 +1832,10 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
           .exchange()
           .getSnapshot();
         const market = resolveMarket(snapshot, marketInput);
+        // Each id as the confirmation names it, from the values parsed: the
+        // order id type is derived from the IDL and carries no shape the
+        // confirmation can rely on.
+        const described: string[] = [];
         const orderIds: PhoenixOrderIds = {
           orderIds: options.order.map((value) => {
             const parts = value.split(":").map((part) => part.trim());
@@ -1567,14 +1844,20 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
                 "--order must use node-pointer:price-ticks:order-sequence-number",
               );
             }
+            const nodePointer = parseU32(parts[0], "node pointer");
+            const priceInTicks = parseU64(parts[1], "order price ticks");
+            const orderSequenceNumber = parseU64(
+              parts[2],
+              "order sequence number",
+            );
+            described.push(
+              `${nodePointer}:${priceInTicks}:${orderSequenceNumber}`,
+            );
             return {
-              nodePointer: { value: parseU32(parts[0], "node pointer") },
+              nodePointer: { value: nodePointer },
               orderId: {
-                priceInTicks: ticks(parseU64(parts[1], "order price ticks")),
-                orderSequenceNumber: parseU64(
-                  parts[2],
-                  "order sequence number",
-                ),
+                priceInTicks: ticks(priceInTicks),
+                orderSequenceNumber,
               },
             };
           }),
@@ -1596,7 +1879,11 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Cancel ${orderIds.orderIds.length} ${market.symbol} Phoenix order(s)?`,
+            message: `Cancel ${orderIds.orderIds.length} ${market.symbol} Phoenix order(s)${(
+              await traderNote(context, options)
+            )
+              .map((note) => ` ${note}`)
+              .join("")}: ${described.join(", ")}?`,
           },
           (txSig) => `Cancelled Phoenix order(s): ${txSig}`,
         );
@@ -1628,11 +1915,19 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
         const market = resolveMarket(snapshot, marketInput);
         const args = {
           side: sideKind(parseSide(side)),
-          numOrdersToCancel: parseOptionalU64(
-            options.numOrders,
-            "number of orders",
-          ),
-          tickLimit: parseOptionalU64(options.tickLimit, "tick limit"),
+          // The program refuses a limit of 0. An option left out sets none.
+          numOrdersToCancel:
+            options.numOrders === undefined
+              ? null
+              : parsePositiveBn(
+                  options.numOrders,
+                  "number of orders",
+                  U64_MAX_BN,
+                ),
+          tickLimit:
+            options.tickLimit === undefined
+              ? null
+              : parsePositiveBn(options.tickLimit, "tick limit", U64_MAX_BN),
         };
         const remainingAccounts =
           await context.glamClient.phoenix.getMarketRemainingAccounts(
@@ -1650,7 +1945,17 @@ export function installPhoenixCommands(phoenix: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Cancel ${market.symbol} Phoenix orders up to limits?`,
+            message: `Cancel ${market.symbol} Phoenix ${sideName(parseSide(side))} orders: ${
+              args.numOrdersToCancel === null
+                ? "no count limit"
+                : `at most ${args.numOrdersToCancel}`
+            }, ${
+              args.tickLimit === null
+                ? "no tick limit"
+                : `tick limit ${args.tickLimit} (${ticksToPriceUsd(market, args.tickLimit)} USD)`
+            }${(await traderNote(context, options))
+              .map((note) => `, ${note}`)
+              .join("")}?`,
           },
           (txSig) => `Cancelled Phoenix orders up to limits: ${txSig}`,
         );

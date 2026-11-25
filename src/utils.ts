@@ -1,4 +1,4 @@
-import { AnchorError, BN } from "@coral-xyz/anchor";
+import { AnchorError, BN, utils as anchorUtils } from "@coral-xyz/anchor";
 import {
   ClusterNetwork,
   type GlamClient,
@@ -6,15 +6,20 @@ import {
   type PriorityLevel,
   StateAccountType,
   type TxOptions,
-  fromUiAmount,
   getProgramAndBitflagByProtocolName,
   getProtocolsAndPermissions,
   getGlamProtocolProgramId,
   parseTxError as sdkParseTxError,
   type TokenListItem,
   fetchMintAndTokenProgram,
+  getPriorityFeeEstimate,
 } from "@glamsystems/glam-sdk";
-import { PublicKey } from "@solana/web3.js";
+import {
+  PublicKey,
+  SYSVAR_CLOCK_PUBKEY,
+  type Transaction,
+  type VersionedTransaction,
+} from "@solana/web3.js";
 import { type InitMintParams } from "anchor/src/client/mint";
 import { type InitStateParams } from "anchor/src/client/state";
 import { type Command } from "commander";
@@ -122,6 +127,17 @@ export class CliConfig {
         throw new Error("Missing wallet or keypair_path in config.json");
       }
 
+      // The SDK sets this as the compute unit price of every send.
+      const microLamports = cliConfig.priority_fee?.micro_lamports;
+      if (
+        microLamports != null &&
+        !(Number.isSafeInteger(microLamports) && microLamports >= 0)
+      ) {
+        throw new Error(
+          `priority_fee.micro_lamports must be a non-negative integer of micro-lamports per compute unit, not ${JSON.stringify(microLamports)}`,
+        );
+      }
+
       if (cliConfig.tx_rpc_url) {
         process.env.TX_RPC = cliConfig.tx_rpc_url;
       }
@@ -202,13 +218,118 @@ export function resolveStagingFromStateOwner(
   return inferredStaging;
 }
 
+/** Where the compute unit price of every send comes from. */
+export type PriorityFeeSource =
+  | { kind: "fixed"; microLamports: number; from: "cluster" | "config" }
+  | { kind: "helius"; apiKey: string; level?: PriorityLevel }
+  | { kind: "none" };
+
+export function priorityFeeSource(cliConfig: CliConfig): PriorityFeeSource {
+  if (cliConfig.cluster === "localnet" || cliConfig.cluster === "devnet") {
+    return { kind: "fixed", microLamports: 1_000_000, from: "cluster" };
+  }
+  const { micro_lamports, helius_api_key, level } =
+    cliConfig.priority_fee || {};
+  if (micro_lamports != null) {
+    return { kind: "fixed", microLamports: micro_lamports, from: "config" };
+  }
+  return helius_api_key
+    ? { kind: "helius", apiKey: helius_api_key, level }
+    : { kind: "none" };
+}
+
+/** The compute unit price a send pays when Helius's estimate fails. */
+export const HELIUS_FALLBACK_MICRO_LAMPORTS = 10_000;
+
+/**
+ * The compute unit price of one send. The SDK falls back to a default of its
+ * own when the estimate throws; the CLI catches the failure itself, so that
+ * the price it pays is the one its confirmation names.
+ */
+export async function priorityFeeMicroLamports(
+  source: PriorityFeeSource,
+  tx: VersionedTransaction,
+  estimate: typeof getPriorityFeeEstimate = getPriorityFeeEstimate,
+): Promise<number> {
+  switch (source.kind) {
+    case "fixed":
+      return source.microLamports;
+    case "helius":
+      try {
+        return await estimate({
+          heliusApiKey: source.apiKey,
+          tx,
+          priorityLevel: source.level,
+        });
+      } catch {
+        return HELIUS_FALLBACK_MICRO_LAMPORTS;
+      }
+    case "none":
+      return 0;
+  }
+}
+
+/** Who pays the fees of a send, and the compute unit price it pays. */
+export function describeFees(
+  source: PriorityFeeSource,
+  feePayer: PublicKey,
+  cluster: string,
+): string {
+  let price: string;
+  if (source.kind === "fixed") {
+    const from =
+      source.from === "config"
+        ? "priority_fee.micro_lamports in the CLI config"
+        : `the CLI's price on ${cluster}`;
+    price = `${source.microLamports} micro-lamports per compute unit requested (${from})`;
+  } else if (source.kind === "helius") {
+    const estimate =
+      source.level && source.level !== "Recommended"
+        ? `${source.level} estimate`
+        : "recommended estimate";
+    price = `Helius's ${estimate} per compute unit requested, with no cap, or ${HELIUS_FALLBACK_MICRO_LAMPORTS} micro-lamports per compute unit requested when the estimate fails`;
+  } else {
+    price = "none";
+  }
+  return `Fee payer: ${feePayer}. Priority fee: ${price}.`;
+}
+
+// Set once the CLI knows its config; every confirmation ends with it. Read
+// at the question, so a command that sends nothing never reads the signer.
+let feeTerms: (() => string) | undefined;
+
+export function setConfirmationFeeTerms(terms: (() => string) | undefined) {
+  feeTerms = terms;
+}
+
 export async function confirmOperation(message: string) {
+  const input = process.stdin;
+  // An input that ends leaves the question open, and the prompt would settle
+  // only when the process exits. End it here instead.
+  const unanswered = new AbortController();
+  const onEnd = () => unanswered.abort();
+  if (input.readableEnded) {
+    onEnd();
+  } else {
+    input.once("end", onEnd);
+  }
   try {
-    const confirmation = await inquirer.prompt([
+    // Asked on stderr, so stdout carries only what the command itself prints.
+    // When stderr is redirected and stdout is the terminal, the question goes
+    // there, where the user can see it.
+    const output =
+      !process.stderr.isTTY && process.stdout.isTTY
+        ? process.stdout
+        : process.stderr;
+    const prompt = inquirer.createPromptModule({
+      output,
+      signal: unanswered.signal,
+    });
+    const confirmation = await prompt([
       {
         type: "confirm",
         name: "proceed",
-        message,
+        message: feeTerms ? `${message}\n${feeTerms()}` : message,
         default: false,
       },
     ]);
@@ -217,15 +338,27 @@ export async function confirmOperation(message: string) {
       process.exit(0);
     }
   } catch (err) {
-    // Handle Ctrl+C interruption gracefully
-    if (
-      (err as any).name === "ExitPromptError" ||
-      (err as any).message?.includes("force closed")
-    ) {
+    const name = (err as any).name;
+    const closed =
+      name === "ExitPromptError" ||
+      (err as any).message?.includes("force closed");
+    // Only a terminal can cancel. On any other input a prompt that ends
+    // unanswered is a failed run, so a script that left out --yes does not
+    // read success.
+    if (name === "AbortPromptError" || (closed && !input.isTTY)) {
+      console.error(
+        "The confirmation got no answer. Nothing was sent. Answer y or n, or pass --yes to skip the confirmation.",
+      );
+      process.exit(1);
+    }
+    // Ctrl+C at the prompt
+    if (closed) {
       console.log("\nOperation cancelled.");
       process.exit(0);
     }
     throw err;
+  } finally {
+    input.removeListener("end", onEnd);
   }
 }
 
@@ -259,6 +392,83 @@ export function parseStateJson(json: any): InitStateParams {
     portfolioManagerName: state.portfolioManagerName
       ? stringToChars(state.portfolioManagerName)
       : null,
+  };
+}
+
+const U16_MAX_BN = new BN(0xffff);
+const U32_MAX_BN = new BN(0xffffffff);
+const U64_MAX = new BN(2).pow(new BN(64)).subn(1);
+
+/**
+ * An unsigned integer field of the vault file: a whole JSON number, or a
+ * decimal string for a value a JSON number cannot hold exactly. The encoder
+ * wrote a negative u64 as its magnitude and cut a fraction, and refused a u16
+ * or u32 out of range only after the confirmation.
+ */
+function jsonUnsigned(value: unknown, label: string, max: BN): BN {
+  let parsed: BN | null = null;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    parsed = new BN(value);
+  } else if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    parsed = new BN(value.trim());
+  }
+  if (parsed === null) {
+    throw new Error(
+      typeof value === "number" && Number.isInteger(value) && value > 0
+        ? `${label} is past 2^53; write it as a decimal string`
+        : `${label} must be a non-negative integer`,
+    );
+  }
+  if (parsed.gt(max)) {
+    throw new Error(`${label} exceeds ${max.toString()}`);
+  }
+  return parsed;
+}
+
+function jsonBool(value: unknown, label: string): boolean {
+  // The string "false" is truthy, and the encoder wrote it as true.
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be true or false`);
+  }
+  return value;
+}
+
+/** An enum field, by its IDL variant name in any case. */
+function jsonVariant(
+  value: unknown,
+  label: string,
+  variants: string[],
+): Record<string, object> {
+  const variant =
+    typeof value === "string"
+      ? variants.find((name) => name.toLowerCase() === value.toLowerCase())
+      : undefined;
+  if (!variant) {
+    throw new Error(`${label} must be one of: ${variants.join(", ")}`);
+  }
+  return { [variant]: {} };
+}
+
+function jsonObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function entryExitFees(value: unknown, label: string) {
+  const fees = jsonObject(value, label);
+  return {
+    subscriptionFeeBps: jsonUnsigned(
+      fees.subscriptionFeeBps,
+      `${label}.subscriptionFeeBps`,
+      U16_MAX_BN,
+    ).toNumber(),
+    redemptionFeeBps: jsonUnsigned(
+      fees.redemptionFeeBps,
+      `${label}.redemptionFeeBps`,
+      U16_MAX_BN,
+    ).toNumber(),
   };
 }
 
@@ -300,64 +510,119 @@ export function parseMintJson(
     );
   }
 
+  // A field left out or set to 0 is sent as none, as before.
+  const optionalU64 = (field: string) =>
+    mint[field] ? jsonUnsigned(mint[field], `mint.${field}`, U64_MAX) : null;
+  const period = (settle: Record<string, unknown>, field: string) =>
+    jsonUnsigned(settle[field] ?? 0, `mint.notifyAndSettle.${field}`, U64_MAX);
+
+  let feeStructure: InitMintParams["feeStructure"] = null;
+  if (mint.feeStructure) {
+    const fees = jsonObject(mint.feeStructure, "mint.feeStructure");
+    const management = jsonObject(
+      fees.management,
+      "mint.feeStructure.management",
+    );
+    const performance = jsonObject(
+      fees.performance,
+      "mint.feeStructure.performance",
+    );
+    feeStructure = {
+      vault: entryExitFees(fees.vault, "mint.feeStructure.vault"),
+      manager: entryExitFees(fees.manager, "mint.feeStructure.manager"),
+      management: {
+        feeBps: jsonUnsigned(
+          management.feeBps,
+          "mint.feeStructure.management.feeBps",
+          U16_MAX_BN,
+        ).toNumber(),
+      },
+      performance: {
+        feeBps: jsonUnsigned(
+          performance.feeBps,
+          "mint.feeStructure.performance.feeBps",
+          U16_MAX_BN,
+        ).toNumber(),
+        hurdleRateBps: jsonUnsigned(
+          performance.hurdleRateBps,
+          "mint.feeStructure.performance.hurdleRateBps",
+          U16_MAX_BN,
+        ).toNumber(),
+        hurdleType: jsonVariant(
+          performance.hurdleType,
+          "mint.feeStructure.performance.hurdleType",
+          ["hard", "soft"],
+        ),
+      },
+      // The program keeps the protocol's own fees whatever is sent here.
+      protocol: { baseFeeBps: 0, flowFeeBps: 0 },
+    } as unknown as InitMintParams["feeStructure"];
+  }
+
+  let notifyAndSettle: InitMintParams["notifyAndSettle"] = null;
+  if (mint.notifyAndSettle) {
+    const settle = jsonObject(mint.notifyAndSettle, "mint.notifyAndSettle");
+    notifyAndSettle = {
+      model: jsonVariant(settle.model, "mint.notifyAndSettle.model", [
+        "continuous",
+        "periodic",
+      ]),
+      permissionlessFulfillment: jsonBool(
+        settle.permissionlessFulfillment ?? false,
+        "mint.notifyAndSettle.permissionlessFulfillment",
+      ),
+      subscribeNoticePeriodType: jsonVariant(
+        settle.subscribeNoticePeriodType,
+        "mint.notifyAndSettle.subscribeNoticePeriodType",
+        ["hard", "soft"],
+      ),
+      subscribeNoticePeriod: period(settle, "subscribeNoticePeriod"),
+      subscribeSettlementPeriod: period(settle, "subscribeSettlementPeriod"),
+      subscribeCancellationWindow: period(
+        settle,
+        "subscribeCancellationWindow",
+      ),
+      redeemNoticePeriodType: jsonVariant(
+        settle.redeemNoticePeriodType,
+        "mint.notifyAndSettle.redeemNoticePeriodType",
+        ["hard", "soft"],
+      ),
+      redeemNoticePeriod: period(settle, "redeemNoticePeriod"),
+      redeemSettlementPeriod: period(settle, "redeemSettlementPeriod"),
+      redeemCancellationWindow: period(settle, "redeemCancellationWindow"),
+      timeUnit: jsonVariant(settle.timeUnit, "mint.notifyAndSettle.timeUnit", [
+        "second",
+        "slot",
+      ]),
+      padding: [0, 0, 0],
+    } as unknown as InitMintParams["notifyAndSettle"];
+  }
+
   return {
     accountType,
     name: stringToChars(mint.name),
     symbol: mint.symbol,
     uri: mint.uri,
     baseAssetMint: new PublicKey(baseAssetMint),
-    maxCap: mint.maxCap ? new BN(mint.maxCap) : null,
-    minSubscription: mint.minSubscription ? new BN(mint.minSubscription) : null,
-    minRedemption: mint.minRedemption ? new BN(mint.minRedemption) : null,
-    lockupPeriod: mint.lockupPeriod ? Number(mint.lockupPeriod) : null,
+    maxCap: optionalU64("maxCap"),
+    minSubscription: optionalU64("minSubscription"),
+    minRedemption: optionalU64("minRedemption"),
+    lockupPeriod: mint.lockupPeriod
+      ? jsonUnsigned(
+          mint.lockupPeriod,
+          "mint.lockupPeriod",
+          U32_MAX_BN,
+        ).toNumber()
+      : null,
     permanentDelegate: mint.permanentDelegate
       ? new PublicKey(mint.permanentDelegate)
       : null,
-    defaultAccountStateFrozen: mint.defaultAccountStateFrozen || false,
-    feeStructure: mint.feeStructure
-      ? {
-          ...mint.feeStructure,
-          performance: {
-            ...mint.feeStructure.performance,
-            hurdleType: {
-              [mint.feeStructure.performance.hurdleType]: {},
-            },
-          },
-          protocol: { baseFeeBps: 0, flowFeeBps: 0 },
-        }
-      : null,
-    notifyAndSettle: mint.notifyAndSettle
-      ? {
-          ...mint.notifyAndSettle,
-          model: { [mint.notifyAndSettle.model]: {} },
-          subscribeNoticePeriodType: {
-            [mint.notifyAndSettle.subscribeNoticePeriodType]: {},
-          },
-          subscribeNoticePeriod: new BN(
-            mint.notifyAndSettle.subscribeNoticePeriod || 0,
-          ),
-          subscribeSettlementPeriod: new BN(
-            mint.notifyAndSettle.subscribeSettlementPeriod || 0,
-          ),
-          subscribeCancellationWindow: new BN(
-            mint.notifyAndSettle.subscribeCancellationWindow || 0,
-          ),
-          redeemNoticePeriodType: {
-            [mint.notifyAndSettle.redeemNoticePeriodType]: {},
-          },
-          redeemNoticePeriod: new BN(
-            mint.notifyAndSettle.redeemNoticePeriod || 0,
-          ),
-          redeemSettlementPeriod: new BN(
-            mint.notifyAndSettle.redeemSettlementPeriod || 0,
-          ),
-          redeemCancellationWindow: new BN(
-            mint.notifyAndSettle.redeemCancellationWindow || 0,
-          ),
-          timeUnit: { [mint.notifyAndSettle.timeUnit]: {} },
-          padding: [0, 0, 0],
-        }
-      : null,
+    defaultAccountStateFrozen: jsonBool(
+      mint.defaultAccountStateFrozen ?? false,
+      "mint.defaultAccountStateFrozen",
+    ),
+    feeStructure,
+    notifyAndSettle,
   };
 }
 
@@ -388,46 +653,6 @@ export function markStagingOnlyCommand(
     });
 }
 
-export function parsePositiveUiAmount(
-  value: string,
-  decimals: number,
-  label?: string,
-): BN {
-  const trimmed = value.trim();
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
-    fail(`${label ?? value} must be a positive decimal amount`);
-  }
-
-  const fractional = trimmed.split(".")[1] ?? "";
-  if (fractional.length > decimals) {
-    fail(`${label ?? value} has more than ${decimals} decimal places`);
-  }
-
-  const parsed = fromUiAmount(trimmed, decimals);
-  if (parsed.isZero()) {
-    fail(`${label ?? value} must be greater than zero`);
-  }
-  return parsed;
-}
-
-export function parseNonNegativeUiAmount(
-  value: string,
-  decimals: number,
-  label?: string,
-): BN {
-  const trimmed = value.trim();
-  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
-    fail(`${label ?? value} must be a non-negative decimal amount`);
-  }
-
-  const fractional = trimmed.split(".")[1] ?? "";
-  if (fractional.length > decimals) {
-    fail(`${label ?? value} has more than ${decimals} decimal places`);
-  }
-
-  return fromUiAmount(trimmed, decimals);
-}
-
 export function parsePositiveInteger(value: string, label?: string): number {
   const trimmed = value.trim();
   if (!/^\d+$/.test(trimmed)) {
@@ -452,35 +677,6 @@ export function parseNonNegativeInteger(value: string, label?: string): number {
     fail(`${label ?? value} must be a safe non-negative integer`);
   }
   return parsed;
-}
-
-export function parsePositiveBn(value: string, label?: string): BN {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    fail(`${label ?? value} must be a positive big integer`);
-  }
-
-  const parsed = new BN(trimmed);
-  if (parsed.isNeg() || parsed.isZero()) {
-    fail(`${label ?? value} must be a positive big integer`);
-  }
-  return parsed;
-}
-
-export function validateInteger(
-  value: string,
-  allowZero: boolean = false,
-): number {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    fail("Amount must be a non-negative integer in raw units");
-  }
-
-  if (!allowZero && /^0+$/.test(trimmed)) {
-    fail("Input value must be greater than zero");
-  }
-
-  return parseInt(trimmed, 10);
 }
 
 export function validatePublicKey(value: string) {
@@ -531,6 +727,112 @@ export function validateBooleanInput(input: string) {
  * @param confirmOptions - Options for confirmation prompt
  * @param successMessage - Success message string or function that takes txSig and returns string
  */
+// Each signature the SDK sends during one executeTxWithErrorHandling call.
+const sentSignatures: string[] = [];
+
+// Each transaction the wallet signed during the call: its id, or null while
+// its first signature is unset. The SDK's send signs right before it sends, so
+// a signed transaction may have gone out whatever the error says of it. A
+// check or a co-signer between the two can stop it, and no error says which.
+const walletSigned: (string | null)[] = [];
+const recordedWallets = new WeakSet<object>();
+
+type SigningWallet = { signTransaction?: (tx: any) => Promise<any> };
+
+/** A signed transaction's id, its first signature in base58, once it is set. */
+function signedTransactionId(tx: unknown): string | null {
+  const signature: Uint8Array | null | undefined =
+    typeof (tx as Transaction | null)?.partialSign === "function"
+      ? (tx as Transaction).signature
+      : (tx as VersionedTransaction | null)?.signatures?.[0];
+  return signature && signature.some((byte) => byte !== 0)
+    ? anchorUtils.bytes.bs58.encode(signature)
+    : null;
+}
+
+/**
+ * Records each transaction the client sends, and each one its wallet signs.
+ * The SDK sends without preflight, so a send whose confirmation then fails
+ * may still land, and a retry would send it again. A send whose answer the
+ * RPC lost reaches no listener: a newer SDK's error carries its id, and the
+ * wallet's signature is the record under an SDK that attaches none.
+ */
+export function recordSentSignatures(glamClient: {
+  onSentListeners: Set<(sig: string) => void>;
+  wallet?: SigningWallet;
+}) {
+  glamClient.onSentListeners.add((sig) => sentSignatures.push(sig));
+
+  let wallet: SigningWallet | undefined;
+  try {
+    wallet = glamClient.wallet;
+  } catch {
+    // A client whose provider has no wallet signs nothing.
+  }
+  // Clients built on one provider share its wallet, which is wrapped once.
+  if (
+    typeof wallet?.signTransaction !== "function" ||
+    recordedWallets.has(wallet)
+  ) {
+    return;
+  }
+  recordedWallets.add(wallet);
+  const sign = wallet.signTransaction.bind(wallet);
+  wallet.signTransaction = async (tx) => {
+    const signed = await sign(tx);
+    walletSigned.push(signedTransactionId(signed));
+    return signed;
+  };
+}
+
+// The longest line printed of an error's own message. An RPC transport error
+// carries the whole response body, which can be an HTML page.
+const OWN_MESSAGE_LIMIT = 200;
+
+/** The first line of `message` that is not blank, cut at OWN_MESSAGE_LIMIT. */
+function firstLine(message: string): string {
+  const line =
+    message
+      .split(/\r?\n/)
+      .map((each) => each.trim())
+      .find((each) => each !== "") ?? "";
+  return line.length > OWN_MESSAGE_LIMIT
+    ? `${line.slice(0, OWN_MESSAGE_LIMIT)}...`
+    : line;
+}
+
+/**
+ * What an error says of itself, in one line. web3.js throws an RPC's refusal
+ * of a send as a SendTransactionError: the first line of its message names no
+ * cause, and the RPC's answer is its `transactionMessage`.
+ */
+function ownLine(error: unknown): string {
+  const { transactionMessage, message } = (error ?? {}) as {
+    transactionMessage?: unknown;
+    message?: unknown;
+  };
+  for (const text of [transactionMessage, message]) {
+    const line = typeof text === "string" ? firstLine(text) : "";
+    if (line !== "") {
+      return line;
+    }
+  }
+  return firstLine(String(error));
+}
+
+/**
+ * What a failure prints. The SDK's parser ends a rate limit, an unavailable
+ * RPC and a timeout with advice to try again. After a signature that advice
+ * would send a second transaction, so the one line the error says of itself
+ * is printed in its place. Any other failure prints as the parser reads it.
+ */
+function failureLine(error: unknown, signed: boolean): string {
+  const parsed = parseTxError(error);
+  return signed && /try again/i.test(parsed) ? ownLine(error) : parsed;
+}
+
+const CHECK_FIRST = "check its status on chain before sending again.";
+
 export async function executeTxWithErrorHandling(
   txFn: () => Promise<string>,
   confirmOptions: {
@@ -538,11 +840,17 @@ export async function executeTxWithErrorHandling(
     message?: string;
   },
   successMessage: string | ((txSig: string) => string),
+  // Printed under the error when the failure signed and sent nothing: a
+  // transaction that went out may still land, and gets no advice to run the
+  // command again.
+  unsentAdvice?: string,
 ): Promise<void> {
   if (!confirmOptions.skip) {
     await confirmOperation(confirmOptions.message || "Confirm operation?");
   }
 
+  sentSignatures.length = 0;
+  walletSigned.length = 0;
   try {
     const txSig = await txFn();
     const message =
@@ -551,9 +859,98 @@ export async function executeTxWithErrorHandling(
         : `${successMessage} ${txSig}`;
     console.log(message);
   } catch (e) {
-    console.error(parseTxError(e));
+    // A newer SDK's error names the transaction it signed and the RPC did not
+    // acknowledge: its answer was lost, or named another transaction.
+    const named = (e as { unacknowledgedSignature?: unknown } | null)
+      ?.unacknowledgedSignature;
+    // Each signed id that no listener heard: the error's, then the wallet's.
+    const unacknowledged = [
+      ...new Set([
+        ...(typeof named === "string" ? [named] : []),
+        ...walletSigned.filter((id): id is string => id !== null),
+      ]),
+    ].filter((id) => !sentSignatures.includes(id));
+    const signed =
+      sentSignatures.length > 0 ||
+      unacknowledged.length > 0 ||
+      walletSigned.length > 0;
+
+    console.error(failureLine(e, signed));
+    if (unsentAdvice && !signed) {
+      console.error(unsentAdvice);
+    }
+    for (const sig of sentSignatures) {
+      console.error(`Sent ${sig}: ${CHECK_FIRST}`);
+    }
+    // Only the id the error names was handed to an RPC's send.
+    for (const sig of unacknowledged) {
+      console.error(
+        sig === named
+          ? `Signed ${sig}, which the RPC did not acknowledge: ${CHECK_FIRST}`
+          : `Signed ${sig}, which may have been sent: ${CHECK_FIRST}`,
+      );
+    }
+    // The wallet signed, and what it returned carries no id to name.
+    if (signed && sentSignatures.length === 0 && unacknowledged.length === 0) {
+      console.error(
+        "The wallet signed a transaction that may have been sent: check the signer's recent transactions on chain before sending again.",
+      );
+    }
     process.exit(1);
   }
+}
+
+/**
+ * The cluster's clock as the programs read it: the Clock sysvar's slot and
+ * unix timestamp, the latter an i64 the programs here take as positive. A
+ * host clock that runs apart from it refused what the program would take.
+ * `readAgainst` names what the time is read for.
+ */
+export async function clusterClock(
+  context: CliContext,
+  readAgainst: string,
+): Promise<{ slot: BN; unixTimestamp: BN }> {
+  const clock =
+    await context.glamClient.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY);
+  if (!clock || clock.data.length < 40) {
+    fail(
+      `The RPC returned no Clock sysvar, which ${readAgainst} is read against`,
+    );
+  }
+  return {
+    slot: new BN(clock.data.subarray(0, 8), "le"),
+    unixTimestamp: new BN(clock.data.subarray(32, 40), "le"),
+  };
+}
+
+/**
+ * Text the CLI did not write, such as a vault name read from the chain or a
+ * file, with each control character written as \uXXXX. The SDK reads a name byte by byte, so it can hold ESC
+ * and CSI sequences that move the cursor and rewrite the addresses a prompt
+ * prints beside it.
+ */
+export function printableText(text: string): string {
+  let printable = "";
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    printable +=
+      code < 0x20 || (code >= 0x7f && code <= 0x9f)
+        ? `\\u${code.toString(16).padStart(4, "0")}`
+        : char;
+  }
+  return printable;
+}
+
+/** A base-unit amount in UI units of `decimals`, exact at any size. */
+export function formatUiAmount(amount: BN, decimals: number): string {
+  const scale = new BN(10).pow(new BN(decimals));
+  const whole = amount.div(scale).toString();
+  const fraction = amount
+    .mod(scale)
+    .toString()
+    .padStart(decimals, "0")
+    .replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
 }
 
 /**

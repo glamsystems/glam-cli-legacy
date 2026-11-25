@@ -1,5 +1,8 @@
 import { BN } from "@coral-xyz/anchor";
-import { LoopscaleVaultPolicy } from "@glamsystems/glam-sdk";
+import {
+  LOOPSCALE_VAULT_PROTOCOL,
+  LoopscaleVaultPolicy,
+} from "@glamsystems/glam-sdk";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import { type Command } from "commander";
 
@@ -9,6 +12,11 @@ import {
   printPubkeyList,
   resolveTokenList,
 } from "../utils";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
 import { fail } from "../errors";
 import {
   parseNonNegativeUiAmount,
@@ -32,6 +40,19 @@ type ClaimRewardsOptions = {
   yes: boolean;
 };
 
+/** The Loopscale vault policy an edit replaces: the staged one under a timelock that holds one. */
+async function loopscaleVaultPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.loopscaleVault.fetchPolicy(),
+    () => context.glamClient.loopscaleVault.programId,
+    LOOPSCALE_VAULT_PROTOCOL,
+    LoopscaleVaultPolicy.decode,
+  );
+}
+
 export function installLoopscaleVaultCommands(
   loopscaleVault: Command,
   context: CliContext,
@@ -53,6 +74,7 @@ export function installLoopscaleVaultCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Reset Loopscale vault policy to an empty default")
     .action(async (options: { yes: boolean }) => {
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.loopscaleVault.setPolicy(
@@ -61,9 +83,9 @@ export function installLoopscaleVaultCommands(
           ),
         {
           skip: options.yes,
-          message: "Confirm resetting Loopscale vault policy",
+          message: timelock.confirm("Confirm resetting Loopscale vault policy"),
         },
-        (txSig) => `Loopscale vault policy reset: ${txSig}`,
+        timelock.outcome("Loopscale vault policy reset"),
       );
     });
 
@@ -73,11 +95,13 @@ export function installLoopscaleVaultCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a Loopscale user vault to the allowlist")
     .action(async (vault: PublicKey, options: { yes?: boolean }) => {
-      const policy =
-        (await context.glamClient.loopscaleVault.fetchPolicy()) ??
-        new LoopscaleVaultPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleVaultPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleVaultPolicy();
       if (policy.vaultAllowlist.find((v) => v.equals(vault))) {
-        fail(`Loopscale vault ${vault} is already in the allowlist`);
+        fail(
+          `Loopscale vault ${vault} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.vaultAllowlist.push(vault);
@@ -89,9 +113,16 @@ export function installLoopscaleVaultCommands(
           ),
         {
           skip: options?.yes ?? false,
-          message: `Confirm adding Loopscale vault ${vault} to allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding Loopscale vault ${vault} to allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale vault allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Loopscale vault ${vault} added to allowlist: ${txSig}`,
+        timelock.outcome(`Loopscale vault ${vault} added to allowlist`),
       );
     });
 
@@ -101,12 +132,18 @@ export function installLoopscaleVaultCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove a Loopscale user vault from the allowlist")
     .action(async (vault: PublicKey, options: { yes?: boolean }) => {
-      const policy = await context.glamClient.loopscaleVault.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleVaultPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No vault policy found");
+        fail(
+          `No vault policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.vaultAllowlist.find((v) => v.equals(vault))) {
-        fail("Vault not in allowlist. Removal not needed.");
+        fail(
+          `Vault not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
       policy.vaultAllowlist = policy.vaultAllowlist.filter(
@@ -120,9 +157,16 @@ export function installLoopscaleVaultCommands(
           ),
         {
           skip: options?.yes ?? false,
-          message: `Confirm removing Loopscale vault ${vault} from allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing Loopscale vault ${vault} from allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale vault allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Loopscale vault ${vault} removed from allowlist: ${txSig}`,
+        timelock.outcome(`Loopscale vault ${vault} removed from allowlist`),
       );
     });
 
@@ -141,10 +185,15 @@ export function installLoopscaleVaultCommands(
       ) => {
         const { accounts, principalDecimals, lpDecimals } =
           await context.glamClient.loopscaleVault.resolveVaultData(vault);
-        const amountIn = parsePositiveUiAmount(amount, principalDecimals);
+        const amountIn = parsePositiveUiAmount(
+          amount,
+          principalDecimals,
+          "amount",
+        );
         const minAmountOut = parseNonNegativeUiAmount(
           options.minAmountOut,
           lpDecimals,
+          "min-amount-out",
         );
 
         await executeTxWithErrorHandling(
@@ -156,7 +205,13 @@ export function installLoopscaleVaultCommands(
             ),
           {
             skip: options.yes,
-            message: `Confirm depositing ${amount} ${accounts.principalMint} into Loopscale vault ${vault}`,
+            // The floor is sent with the amount: 0 accepts any LP amount.
+            message: [
+              "Confirm Loopscale vault deposit",
+              `vault: ${vault}`,
+              `principal: ${amount.trim()} (${amountIn} base units of ${accounts.principalMint})`,
+              `minimum LP out: ${options.minAmountOut.trim()} (${minAmountOut} base units)`,
+            ].join("\n"),
           },
           (txSig) => `Loopscale vault deposit successful: ${txSig}`,
         );
@@ -182,10 +237,15 @@ export function installLoopscaleVaultCommands(
       ) => {
         const accounts =
           await context.glamClient.loopscaleVault.resolveVaultData(vault);
-        const amountIn = parsePositiveUiAmount(amount, accounts.lpDecimals);
+        const amountIn = parsePositiveUiAmount(
+          amount,
+          accounts.lpDecimals,
+          "amount",
+        );
         const minAmountOut = parseNonNegativeUiAmount(
           options.minAmountOut,
           accounts.principalDecimals,
+          "min-amount-out",
         );
 
         await executeTxWithErrorHandling(
@@ -197,7 +257,13 @@ export function installLoopscaleVaultCommands(
             ),
           {
             skip: options.yes,
-            message: `Confirm burning ${amount} LP tokens from Loopscale vault ${vault}`,
+            // The floor is sent with the amount: 0 accepts any principal amount.
+            message: [
+              "Confirm Loopscale vault withdrawal",
+              `vault: ${vault}`,
+              `LP burned: ${amount.trim()} (${amountIn} base units)`,
+              `minimum principal out: ${options.minAmountOut.trim()} (${minAmountOut} base units of ${accounts.accounts.principalMint})`,
+            ].join("\n"),
           },
           (txSig) => `Loopscale vault withdrawal successful: ${txSig}`,
         );
@@ -308,7 +374,12 @@ export function installLoopscaleVaultCommands(
           ),
         {
           skip: options.yes,
-          message: `Confirm claiming rewards from Loopscale vault stake ${options.stake}`,
+          // ext_loopscale adds each claimed mint to the vault's assets.
+          message: [
+            `Confirm claiming rewards from Loopscale vault stake ${options.stake}`,
+            `vault: ${vault}`,
+            `reward mints, each added to the vault's assets: ${mints.join(", ")}`,
+          ].join("\n"),
         },
         (txSig) => `Loopscale vault rewards claimed: ${txSig}`,
       );

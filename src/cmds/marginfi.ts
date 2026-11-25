@@ -1,5 +1,9 @@
 import { BN } from "@coral-xyz/anchor";
-import { MarginfiPolicy } from "@glamsystems/glam-sdk";
+import {
+  MARGINFI_PROTOCOL,
+  MarginfiPolicy,
+  U64_MAX_BN,
+} from "@glamsystems/glam-sdk";
 import { type Command } from "commander";
 
 import {
@@ -9,16 +13,34 @@ import {
   resolveTokenPublicKey,
 } from "../utils";
 import {
-  parseNonNegativeInteger,
-  parsePositiveBn,
-  validatePublicKey,
-} from "../parsing";
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import { fail } from "../errors";
+import { parsePositiveBn, parseU16, validatePublicKey } from "../parsing";
+
+/** The Marginfi policy an edit replaces: the staged one under a timelock that holds one. */
+async function marginfiPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.marginfi.fetchPolicy(),
+    () => context.glamClient.extMarginfiProgram.programId,
+    MARGINFI_PROTOCOL,
+    MarginfiPolicy.decode,
+  );
+}
 
 export function installMarginfiCommands(
   marginfi: Command,
   context: CliContext,
 ) {
   const pk = (value: string) => validatePublicKey(value);
+  // Each amount is a u64 in base units.
+  const amountRaw = (value: string) =>
+    parsePositiveBn(value, "amount", U64_MAX_BN);
 
   marginfi
     .command("view-policy")
@@ -43,16 +65,26 @@ export function installMarginfiCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a Marginfi group to the policy allowlist")
     .action(async (group, options) => {
-      const policy =
-        (await context.glamClient.marginfi.fetchPolicy()) ??
-        new MarginfiPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await marginfiPolicyToEdit(context, timelock);
+      const policy = base.value ?? new MarginfiPolicy([], [], []);
       if (!policy.groupsAllowlist.find((g) => g.equals(group))) {
         policy.groupsAllowlist.push(group);
       }
       await executeTxWithErrorHandling(
         () => context.glamClient.marginfi.setPolicy(policy, context.txOptions),
-        { skip: options?.yes, message: `Confirm adding group ${group}` },
-        (txSig) => `Marginfi group ${group} allowlisted: ${txSig}`,
+        {
+          skip: options?.yes,
+          message: timelock.confirm(
+            [
+              `Confirm adding group ${group}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Marginfi policy")]
+                : []),
+            ].join("\n"),
+          ),
+        },
+        timelock.outcome(`Marginfi group ${group} allowlisted`),
       );
     });
 
@@ -62,16 +94,26 @@ export function installMarginfiCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a Marginfi bank to the policy allowlist")
     .action(async (bank, options) => {
-      const policy =
-        (await context.glamClient.marginfi.fetchPolicy()) ??
-        new MarginfiPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await marginfiPolicyToEdit(context, timelock);
+      const policy = base.value ?? new MarginfiPolicy([], [], []);
       if (!policy.banksAllowlist.find((b) => b.equals(bank))) {
         policy.banksAllowlist.push(bank);
       }
       await executeTxWithErrorHandling(
         () => context.glamClient.marginfi.setPolicy(policy, context.txOptions),
-        { skip: options?.yes, message: `Confirm adding bank ${bank}` },
-        (txSig) => `Marginfi bank ${bank} allowlisted: ${txSig}`,
+        {
+          skip: options?.yes,
+          message: timelock.confirm(
+            [
+              `Confirm adding bank ${bank}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Marginfi policy")]
+                : []),
+            ].join("\n"),
+          ),
+        },
+        timelock.outcome(`Marginfi bank ${bank} allowlisted`),
       );
     });
 
@@ -83,9 +125,9 @@ export function installMarginfiCommands(
     .description("Add a borrowable token to the Marginfi policy")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.marginfi.fetchPolicy()) ??
-        new MarginfiPolicy([], [], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await marginfiPolicyToEdit(context, timelock);
+      const policy = base.value ?? new MarginfiPolicy([], [], []);
       if (!policy.borrowAllowlist.find((t) => t.equals(token))) {
         policy.borrowAllowlist.push(token);
       }
@@ -93,9 +135,16 @@ export function installMarginfiCommands(
         () => context.glamClient.marginfi.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding borrowable token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding borrowable token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Marginfi policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Marginfi borrowable token ${token} allowlisted: ${txSig}`,
+        timelock.outcome(`Marginfi borrowable token ${token} allowlisted`),
       );
     });
 
@@ -108,7 +157,7 @@ export function installMarginfiCommands(
     )
     .argument("[account-index]", "Marginfi account index for legacy form")
     .option("--third-party-id <id>", "Optional third party id", (value) =>
-      parseNonNegativeInteger(value, "third-party-id"),
+      parseU16(value, "third-party-id"),
     )
     .description(
       "Initialize a Marginfi account PDA with the GLAM vault as authority",
@@ -122,11 +171,8 @@ export function installMarginfiCommands(
       ) => {
         const accountIndex =
           accountIndexArg === undefined
-            ? parseNonNegativeInteger(
-                accountIndexOrMarginfiAccount,
-                "account-index",
-              )
-            : parseNonNegativeInteger(accountIndexArg, "account-index");
+            ? parseU16(accountIndexOrMarginfiAccount, "account-index")
+            : parseU16(accountIndexArg, "account-index");
         const marginfiAccount =
           accountIndexArg === undefined
             ? context.glamClient.marginfi.getAccountPda(
@@ -172,11 +218,11 @@ export function installMarginfiCommands(
     .command("borrow")
     .argument("<bank>", "Borrow bank", validatePublicKey)
     .argument("<marginfi-account>", "Marginfi account", validatePublicKey)
-    .argument("<amount>", "Native token amount to borrow", parsePositiveBn)
+    .argument("<amount>", "Amount to borrow, in base units", amountRaw)
     .option("--group <pubkey>", "Override derived Marginfi group", pk)
     .option(
       "--destination-token-account <pubkey>",
-      "Override derived vault token account to receive borrowed funds",
+      "The vault's associated token account for the bank's mint, the only account the borrow can pay into",
       pk,
     )
     .option(
@@ -189,32 +235,48 @@ export function installMarginfiCommands(
       "Override derived bank liquidity vault",
       pk,
     )
+    .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Borrow from a Marginfi bank")
     .action(async (bank, marginfiAccount, amount: BN, options) => {
+      // The accounts are resolved before the confirmation, which names the
+      // token account that receives the funds. The Marginfi account takes
+      // the debt, not the tokens.
+      const derived = await context.glamClient.marginfi.resolveBorrowAccounts(
+        bank,
+        marginfiAccount,
+      );
+      // The SDK creates the vault's associated token account at the
+      // destination before it borrows, so another account fails the
+      // transaction after the confirmation.
+      if (
+        options.destinationTokenAccount &&
+        !options.destinationTokenAccount.equals(derived.destinationTokenAccount)
+      ) {
+        fail(
+          `--destination-token-account ${options.destinationTokenAccount} is not ${derived.destinationTokenAccount}, the vault's associated token account for the bank's mint, which the borrow creates and pays into`,
+        );
+      }
+      const accounts = {
+        ...derived,
+        group: options.group ?? derived.group,
+        destinationTokenAccount:
+          options.destinationTokenAccount ?? derived.destinationTokenAccount,
+        bankLiquidityVaultAuthority:
+          options.bankLiquidityVaultAuthority ??
+          derived.bankLiquidityVaultAuthority,
+        liquidityVault: options.liquidityVault ?? derived.liquidityVault,
+      };
       await executeTxWithErrorHandling(
-        async () => {
-          const accounts =
-            await context.glamClient.marginfi.resolveBorrowAccounts(
-              bank,
-              marginfiAccount,
-            );
-          return await context.glamClient.marginfi.borrow(
-            {
-              ...accounts,
-              group: options.group ?? accounts.group,
-              destinationTokenAccount:
-                options.destinationTokenAccount ??
-                accounts.destinationTokenAccount,
-              bankLiquidityVaultAuthority:
-                options.bankLiquidityVaultAuthority ??
-                accounts.bankLiquidityVaultAuthority,
-              liquidityVault: options.liquidityVault ?? accounts.liquidityVault,
-            },
+        () =>
+          context.glamClient.marginfi.borrow(
+            accounts,
             amount,
             context.txOptions,
-          );
+          ),
+        {
+          skip: !!options.yes,
+          message: `Confirm borrowing ${amount} base units from Marginfi bank ${bank} into token account ${accounts.destinationTokenAccount}, as debt of Marginfi account ${marginfiAccount}`,
         },
-        { skip: true },
         (txSig) => `Borrowed from Marginfi: ${txSig}`,
       );
     });
@@ -223,25 +285,32 @@ export function installMarginfiCommands(
     .command("repay")
     .argument("<bank>", "Repay bank", validatePublicKey)
     .argument("<marginfi-account>", "Marginfi account", validatePublicKey)
-    .argument("<amount>", "Native token amount to repay", parsePositiveBn)
+    .argument("<amount>", "Amount to repay, in base units", amountRaw)
     .option("--all", "Repay all", false)
+    .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Repay a Marginfi borrow")
     .action(async (bank, marginfiAccount, amount: BN, options) => {
+      // As in borrow: the tokens leave a token account, and the Marginfi
+      // account is the one whose debt they repay.
+      const accounts = await context.glamClient.marginfi.resolveRepayAccounts(
+        bank,
+        marginfiAccount,
+      );
+      const paid = `from token account ${accounts.sourceTokenAccount}, against the debt of Marginfi account ${marginfiAccount}`;
       await executeTxWithErrorHandling(
-        async () => {
-          const accounts =
-            await context.glamClient.marginfi.resolveRepayAccounts(
-              bank,
-              marginfiAccount,
-            );
-          return await context.glamClient.marginfi.repay(
+        () =>
+          context.glamClient.marginfi.repay(
             accounts,
             amount,
             options.all ? true : null,
             context.txOptions,
-          );
+          ),
+        {
+          skip: !!options.yes,
+          message: options.all
+            ? `Confirm repaying the whole borrow at Marginfi bank ${bank} ${paid} (--all, sent with the amount ${amount})`
+            : `Confirm repaying ${amount} base units to Marginfi bank ${bank} ${paid}`,
         },
-        { skip: true },
         (txSig) => `Repaid Marginfi borrow: ${txSig}`,
       );
     });
@@ -250,9 +319,14 @@ export function installMarginfiCommands(
     .command("kamino-deposit")
     .argument("<bank>", "Marginfi Kamino bank", validatePublicKey)
     .argument("<marginfi-account>", "Marginfi account", validatePublicKey)
-    .argument("<amount>", "Native token amount to deposit", parsePositiveBn)
+    .argument(
+      "<amount>",
+      "Amount to deposit, in base units of the liquidity token",
+      amountRaw,
+    )
+    .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Deposit Kamino-backed collateral into Marginfi")
-    .action(async (bank, marginfiAccount, amount: BN) => {
+    .action(async (bank, marginfiAccount, amount: BN, options) => {
       await executeTxWithErrorHandling(
         async () => {
           const accounts =
@@ -266,7 +340,10 @@ export function installMarginfiCommands(
             context.txOptions,
           );
         },
-        { skip: true },
+        {
+          skip: !!options.yes,
+          message: `Confirm depositing ${amount} base units into Marginfi Kamino bank ${bank} for account ${marginfiAccount}`,
+        },
         (txSig) => `Deposited Kamino-backed collateral into Marginfi: ${txSig}`,
       );
     });
@@ -275,8 +352,13 @@ export function installMarginfiCommands(
     .command("kamino-withdraw")
     .argument("<bank>", "Marginfi Kamino bank", validatePublicKey)
     .argument("<marginfi-account>", "Marginfi account", validatePublicKey)
-    .argument("<amount>", "Native token amount to withdraw", parsePositiveBn)
+    .argument(
+      "<amount>",
+      "Amount to withdraw, in base units of the Kamino collateral token (not of the liquidity token)",
+      amountRaw,
+    )
     .option("--all", "Withdraw all", false)
+    .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Withdraw Kamino-backed collateral from Marginfi")
     .action(async (bank, marginfiAccount, amount: BN, options) => {
       await executeTxWithErrorHandling(
@@ -293,7 +375,12 @@ export function installMarginfiCommands(
             context.txOptions,
           );
         },
-        { skip: true },
+        {
+          skip: !!options.yes,
+          message: options.all
+            ? `Confirm withdrawing the whole balance from Marginfi Kamino bank ${bank} for account ${marginfiAccount} (--all, sent with the amount ${amount})`
+            : `Confirm withdrawing ${amount} base units of Kamino collateral from Marginfi Kamino bank ${bank} for account ${marginfiAccount}`,
+        },
         (txSig) => `Withdrew Kamino-backed collateral from Marginfi: ${txSig}`,
       );
     });

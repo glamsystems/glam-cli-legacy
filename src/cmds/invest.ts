@@ -1,9 +1,25 @@
 import { BN } from "@coral-xyz/anchor";
 import { GlamClient, fetchMintAndTokenProgram } from "@glamsystems/glam-sdk";
 import { type Command } from "commander";
-import { type CliContext, executeTxWithErrorHandling } from "../utils";
+import { type PublicKey } from "@solana/web3.js";
+import {
+  type CliContext,
+  executeTxWithErrorHandling,
+  printableText,
+  recordSentSignatures,
+} from "../utils";
 import { parsePositiveUiAmount, validatePublicKey } from "../parsing";
 import tokens from "../tokens-verified.json";
+
+/** The vault a command acts on, and where the CLI took it from. */
+function vaultNamed(
+  name: string,
+  state: PublicKey,
+  shareMint: PublicKey,
+  fromConfig: boolean,
+): string {
+  return `vault${name ? ` ${printableText(name)}` : ""} (state ${state}, share mint ${shareMint}${fromConfig ? "; the active vault in the CLI config" : ""})`;
+}
 
 export function installInvestCommands(invest: Command, context: CliContext) {
   invest
@@ -27,6 +43,7 @@ export function installInvestCommands(invest: Command, context: CliContext) {
           // The same transaction version the session was started with.
           transactionVersion: context.glamClient.transactionVersion,
         });
+        recordSentSignatures(glamClient);
       }
 
       const stateModel = await glamClient.fetchStateModel();
@@ -69,7 +86,7 @@ export function installInvestCommands(invest: Command, context: CliContext) {
           }),
         {
           skip: options?.yes,
-          message: `Confirm ${options?.queued ? "queued" : "instant"} subscription with ${amount} ${symbol} (${name})?`,
+          message: `Confirm ${options?.queued ? "queued" : "instant"} subscription with ${amount} ${symbol} (${name}) to ${vaultNamed(stateModel.nameStr, glamClient.statePda, glamClient.mintPda, !state)}?`,
         },
         (txSig) =>
           `${glamClient.signer} ${options?.queued ? "queued" : "instant"} subscription: ${txSig}`,
@@ -125,7 +142,7 @@ export function installInvestCommands(invest: Command, context: CliContext) {
           context.glamClient.invest.queuedRedeem(amountBN, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm queued redemption of ${amount} shares`,
+          message: `Confirm queued redemption of ${amount} shares of ${vaultNamed(stateModel.nameStr, context.glamClient.statePda, context.glamClient.mintPda, true)}`,
         },
         (txSig) => `${context.glamClient.signer} requested to redeem: ${txSig}`,
       );
@@ -157,11 +174,12 @@ export function installInvestCommands(invest: Command, context: CliContext) {
       "Cancel a queued subscription or redemption request that has not been fulfilled",
     )
     .action(async (options) => {
+      const stateModel = await context.glamClient.fetchStateModel();
       await executeTxWithErrorHandling(
         () => context.glamClient.invest.cancel(context.txOptions),
         {
           skip: options?.yes,
-          message: "Confirm canceling queued subscription or redemption?",
+          message: `Confirm canceling the queued subscription or redemption in ${vaultNamed(stateModel.nameStr, context.glamClient.statePda, context.glamClient.mintPda, true)}?`,
         },
         (txSig) =>
           `${context.glamClient.signer} cancelled queued request: ${txSig}`,

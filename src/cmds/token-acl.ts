@@ -1,5 +1,11 @@
 import { type Command } from "commander";
-import { type CliContext, executeTxWithErrorHandling } from "../utils";
+import { type PublicKey } from "@solana/web3.js";
+import { fail } from "../errors";
+import {
+  type CliContext,
+  executeTxWithErrorHandling,
+  printableText,
+} from "../utils";
 import { collectPublicKeys, validatePublicKey } from "../parsing";
 import {
   isTokenAclEnabled,
@@ -20,20 +26,101 @@ function parseSeed(seedStr: string): Buffer {
   return seed;
 }
 
-function parseMode(modeStr: string): number {
-  switch (modeStr.toLowerCase()) {
-    case "allow":
-      return 0;
-    case "allow-all-eoas":
-      return 1;
-    case "block":
-      return 2;
-    default:
-      console.error(
-        `Invalid mode: ${modeStr}. Allowed values: allow, allow-all-eoas, block`,
-      );
-      process.exit(1);
+const MODES = new Map([
+  ["allow", 0],
+  ["allow-all-eoas", 1],
+  ["block", 2],
+]);
+
+/**
+ * A list's mode, and its name and seed. The seed is the mode's name in
+ * lowercase, as setup-gate links the lists: the text as typed, `Allow`,
+ * would name another list.
+ */
+function parseMode(modeStr: string): {
+  mode: number;
+  name: string;
+  seed: Buffer;
+} {
+  const name = modeStr.toLowerCase();
+  const mode = MODES.get(name);
+  if (mode === undefined) {
+    console.error(
+      `Invalid mode: ${modeStr}. Allowed values: allow, allow-all-eoas, block`,
+    );
+    process.exit(1);
   }
+  return { mode, name, seed: parseSeed(name) };
+}
+
+// A gate ListConfig: discriminator (1), authority (32), seed (32), mode (1)
+// and wallets count (8).
+const LIST_CONFIG_SIZE = 74;
+
+/** The seed of a ListConfig's data as text, its zero padding dropped. */
+function listSeedText(data: Buffer): string {
+  return printableText(
+    Buffer.from(data.subarray(33, 65)).toString().replace(/\0+$/, ""),
+  );
+}
+
+/**
+ * The existing list a command acts on: the one `--list` names, or the one
+ * seeded with `--mode` exactly as typed. Earlier CLIs seeded a list with the
+ * text as typed, so a list made as `Allow` has another address than `allow`,
+ * and neither stands in for the other: a retried deletion would otherwise
+ * delete the second. The account must be a gate list of this mint.
+ */
+async function existingList(
+  context: CliContext,
+  options: { mode?: string; list?: PublicKey },
+): Promise<{ seed: string; label: string; listConfigPda: PublicKey }> {
+  const { mintPda } = context.glamClient;
+  if ((options.mode === undefined) === (options.list === undefined)) {
+    fail(
+      "Name the list with --mode, its seed exactly as it was made, or with --list, its ListConfig address, and not both",
+    );
+  }
+  let listConfigPda: PublicKey;
+  let lowercase: PublicKey | undefined;
+  if (options.list) {
+    listConfigPda = options.list;
+  } else {
+    const { name } = parseMode(options.mode!);
+    listConfigPda = getTokenAclGateListConfigPda(
+      mintPda,
+      parseSeed(options.mode!),
+    );
+    if (options.mode !== name) {
+      lowercase = getTokenAclGateListConfigPda(mintPda, parseSeed(name));
+    }
+  }
+  const [account, lowercaseAccount] =
+    await context.glamClient.connection.getMultipleAccountsInfo(
+      lowercase ? [listConfigPda, lowercase] : [listConfigPda],
+    );
+  if (!account) {
+    const named = options.list
+      ? `${listConfigPda} has no account`
+      : `No list is seeded "${printableText(options.mode!)}" for this mint (ListConfig PDA ${listConfigPda})`;
+    fail(
+      lowercaseAccount
+        ? `${named}. The list seeded "${parseMode(options.mode!).name}" is ${lowercase}: pass --mode ${parseMode(options.mode!).name}, or --list ${lowercase}`
+        : named,
+    );
+  }
+  const data = Buffer.from(account.data);
+  if (
+    !account.owner.equals(TOKEN_ACL_GATE_PROGRAM) ||
+    data.length !== LIST_CONFIG_SIZE ||
+    !data.subarray(1, 33).equals(mintPda.toBuffer())
+  ) {
+    fail(
+      `${listConfigPda} is not a Token ACL gate list of this mint ${mintPda}`,
+    );
+  }
+  const seed = listSeedText(data);
+  return { seed, label: `the list seeded "${seed}"`, listConfigPda };
 }
 
 export function installTokenAclCommands(
@@ -181,8 +268,7 @@ export function installTokenAclCommands(
     .description("Create a Token ACL list")
     .action(async (options) => {
       const { glamClient, txOptions } = context;
-      const seed = parseSeed(options.mode);
-      const mode = parseMode(options.mode);
+      const { mode, name, seed } = parseMode(options.mode);
       const listConfigPda = getTokenAclGateListConfigPda(
         glamClient.mintPda,
         seed,
@@ -192,7 +278,7 @@ export function installTokenAclCommands(
         () => glamClient.mint.aclGateCreateList(seed, mode, txOptions),
         {
           skip: options?.yes,
-          message: `Create ${options.mode} list? ListConfig PDA: ${listConfigPda}`,
+          message: `Create ${name} list? ListConfig PDA: ${listConfigPda}`,
         },
         (txSig) => `List created: ${txSig}\nListConfig PDA: ${listConfigPda}`,
       );
@@ -200,23 +286,26 @@ export function installTokenAclCommands(
 
   tokenAcl
     .command("delete-list")
-    .requiredOption("--mode <mode>", "List mode: allow, block, allow-all-eoas")
+    .option(
+      "--mode <mode>",
+      "The list's seed, a mode name exactly as the list was made: allow, block or allow-all-eoas, or a list an earlier CLI made with capitals, such as Allow",
+    )
+    .option(
+      "--list <address>",
+      "The list's ListConfig address, instead of --mode",
+      validatePublicKey,
+    )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Delete a Token ACL list")
     .action(async (options) => {
       const { glamClient, txOptions } = context;
-      parseMode(options.mode); // validate mode
-      const seed = parseSeed(options.mode);
-      const listConfigPda = getTokenAclGateListConfigPda(
-        glamClient.mintPda,
-        seed,
-      );
+      const { label, listConfigPda } = await existingList(context, options);
 
       await executeTxWithErrorHandling(
         () => glamClient.mint.aclGateDeleteList(listConfigPda, txOptions),
         {
           skip: options?.yes,
-          message: `Delete ${options.mode} list? ListConfig PDA: ${listConfigPda.toBase58()}`,
+          message: `Delete ${label}? ListConfig PDA: ${listConfigPda.toBase58()}`,
         },
         (txSig) =>
           `List deleted: ${txSig}\nListConfig PDA: ${listConfigPda.toBase58()}\n` +
@@ -227,24 +316,27 @@ export function installTokenAclCommands(
   tokenAcl
     .command("add-wallet")
     .argument("<wallet>", "Wallet public key to add", validatePublicKey)
-    .requiredOption("--mode <mode>", "List mode: allow, block, allow-all-eoas")
+    .option(
+      "--mode <mode>",
+      "The list's seed, a mode name exactly as the list was made: allow, block or allow-all-eoas, or a list an earlier CLI made with capitals, such as Allow",
+    )
+    .option(
+      "--list <address>",
+      "The list's ListConfig address, instead of --mode",
+      validatePublicKey,
+    )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a wallet to a Token ACL list")
     .action(async (wallet, options) => {
       const { glamClient, txOptions } = context;
-      parseMode(options.mode); // validate mode
-      const seed = parseSeed(options.mode);
-      const listConfigPda = getTokenAclGateListConfigPda(
-        glamClient.mintPda,
-        seed,
-      );
+      const { label, listConfigPda } = await existingList(context, options);
 
       await executeTxWithErrorHandling(
         () =>
           glamClient.mint.aclGateAddWallet(listConfigPda, wallet, txOptions),
         {
           skip: options?.yes,
-          message: `Add wallet ${wallet.toBase58()} to ${options.mode} list?`,
+          message: `Add wallet ${wallet.toBase58()} to ${label}? ListConfig PDA: ${listConfigPda.toBase58()}`,
         },
         (txSig) => `Wallet added: ${txSig}`,
       );
@@ -253,17 +345,20 @@ export function installTokenAclCommands(
   tokenAcl
     .command("remove-wallet")
     .argument("<wallet>", "Wallet public key to remove", validatePublicKey)
-    .requiredOption("--mode <mode>", "List mode: allow, block, allow-all-eoas")
+    .option(
+      "--mode <mode>",
+      "The list's seed, a mode name exactly as the list was made: allow, block or allow-all-eoas, or a list an earlier CLI made with capitals, such as Allow",
+    )
+    .option(
+      "--list <address>",
+      "The list's ListConfig address, instead of --mode",
+      validatePublicKey,
+    )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove a wallet from a Token ACL list")
     .action(async (wallet, options) => {
       const { glamClient, txOptions } = context;
-      parseMode(options.mode); // validate mode
-      const seed = parseSeed(options.mode);
-      const listConfigPda = getTokenAclGateListConfigPda(
-        glamClient.mintPda,
-        seed,
-      );
+      const { label, listConfigPda } = await existingList(context, options);
       const walletEntryPda = getTokenAclGateWalletEntryPda(
         listConfigPda,
         wallet,
@@ -278,7 +373,7 @@ export function installTokenAclCommands(
           ),
         {
           skip: options?.yes,
-          message: `Remove wallet ${wallet.toBase58()} from ${options.mode} list?`,
+          message: `Remove wallet ${wallet.toBase58()} from ${label}? ListConfig PDA: ${listConfigPda.toBase58()}`,
         },
         (txSig) => `Wallet removed: ${txSig}`,
       );
@@ -286,25 +381,25 @@ export function installTokenAclCommands(
 
   tokenAcl
     .command("list-wallets")
-    .requiredOption("--mode <mode>", "List mode: allow, block, allow-all-eoas")
+    .option(
+      "--mode <mode>",
+      "The list's seed, a mode name exactly as the list was made: allow, block or allow-all-eoas, or a list an earlier CLI made with capitals, such as Allow",
+    )
+    .option(
+      "--list <address>",
+      "The list's ListConfig address, instead of --mode",
+      validatePublicKey,
+    )
     .description("List all wallets in a Token ACL list")
     .action(async (options) => {
       const { glamClient } = context;
-      parseMode(options.mode); // validate mode
-      const seed = parseSeed(options.mode);
-      const listConfigPda = getTokenAclGateListConfigPda(
-        glamClient.mintPda,
-        seed,
-      );
+      const { seed, listConfigPda } = await existingList(context, options);
 
       // Fetch and display list config
       const listConfigInfo =
         await glamClient.connection.getAccountInfo(listConfigPda);
       if (!listConfigInfo) {
-        console.error(
-          `List "${options.mode}" not found (PDA: ${listConfigPda.toBase58()})`,
-        );
-        process.exit(1);
+        fail(`List "${seed}" not found (PDA: ${listConfigPda.toBase58()})`);
       }
       const listConfig = TokenAclListConfig.decode(
         listConfigPda,
@@ -312,7 +407,7 @@ export function installTokenAclCommands(
       );
       const walletsCount = listConfig.walletsCount;
 
-      console.log(`List: "${options.mode}"`);
+      console.log(`List: "${seed}"`);
       console.log(`ListConfig PDA: ${listConfigPda.toBase58()}`);
       console.log(`Mode: ${listConfig.modeName}`);
       console.log(`Wallets count: ${walletsCount.toString()}`);
@@ -364,12 +459,21 @@ export function installTokenAclCommands(
       );
 
       // Additional lists provided by user
-      const additionalListConfigs = options.additionalLists || [];
+      const additionalListConfigs: PublicKey[] = options.additionalLists || [];
       const allListConfigs = [...listConfigs, ...additionalListConfigs];
 
-      // Skip list configs that are invalid (onchain account doesn't exist)
+      // A default list that was never created is skipped; a list the user
+      // names and that has no account is a mistake, and is refused.
       const accounts =
         await glamClient.connection.getMultipleAccountsInfo(allListConfigs);
+      const missingAdditional = additionalListConfigs.filter(
+        (_, index) => !accounts[listConfigs.length + index],
+      );
+      if (missingAdditional.length > 0) {
+        fail(
+          `setup-gate links only lists that exist, and ${missingAdditional.join(", ")} given in --additional-lists ${missingAdditional.length === 1 ? "has" : "have"} no account`,
+        );
+      }
       const validListConfigs = allListConfigs.filter(
         (_, index) => accounts[index],
       );

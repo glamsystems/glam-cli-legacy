@@ -11,6 +11,7 @@ import {
   validatePublicKey,
 } from "../parsing";
 import { Transaction } from "@solana/web3.js";
+import { readVaultTimelock } from "../staging";
 import {
   toUiAmount,
   RequestType,
@@ -66,7 +67,7 @@ export function installManageCommands(manage: Command, context: CliContext) {
     .description("Claim fees collected by tokenized vault")
     .action(async () => {
       await executeTxWithErrorHandling(
-        () => context.glamClient.fees.claimFees(),
+        () => context.glamClient.fees.claimFees(context.txOptions),
         { skip: true },
         (txSig) => `Fees claimed: ${txSig}`,
       );
@@ -84,6 +85,7 @@ export function installManageCommands(manage: Command, context: CliContext) {
         baseAssetDecimals!,
         "amount",
       );
+      const timelock = await readVaultTimelock(context);
 
       await executeTxWithErrorHandling(
         () =>
@@ -93,24 +95,32 @@ export function installManageCommands(manage: Command, context: CliContext) {
           ),
         {
           skip: options?.yes,
-          message: `Confirm updating minimum subscription amount to ${amount}`,
+          message: timelock.confirm(
+            `Confirm updating minimum subscription amount to ${amount}`,
+          ),
         },
-        (txSig) => `Updated minimum subscription amount to ${amount}: ${txSig}`,
+        timelock.outcome(`Updated minimum subscription amount to ${amount}`),
       );
     });
 
   manage
     .command("update-min-redemption")
-    .argument("<amount>", "Minimum redemption UI amount")
+    .argument("<amount>", "Minimum redemption UI amount of shares")
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Update the minimum redemption amount")
     .action(async (amount, options) => {
-      const { baseAssetDecimals } = await context.glamClient.fetchStateModel();
+      // The program compares this minimum with the shares a redemption burns,
+      // and a share mint may have more decimals than the base asset.
+      const { mint } = await fetchMintAndTokenProgram(
+        context.glamClient.connection,
+        context.glamClient.mintPda,
+      );
       const amountBN = parseNonNegativeUiAmount(
         amount,
-        baseAssetDecimals!,
+        mint.decimals,
         "amount",
       );
+      const timelock = await readVaultTimelock(context);
 
       await executeTxWithErrorHandling(
         () =>
@@ -120,9 +130,13 @@ export function installManageCommands(manage: Command, context: CliContext) {
           ),
         {
           skip: options?.yes,
-          message: `Confirm updating minimum redemption amount to ${amount}`,
+          message: timelock.confirm(
+            `Confirm updating minimum redemption amount to ${amount} shares`,
+          ),
         },
-        (txSig) => `Updated minimum redemption amount to ${amount}: ${txSig}`,
+        timelock.outcome(
+          `Updated minimum redemption amount to ${amount} shares`,
+        ),
       );
     });
 
@@ -130,8 +144,12 @@ export function installManageCommands(manage: Command, context: CliContext) {
     .command("pause")
     .argument("<action>", "Action to pause", validateInvestorAction)
     .option("-y, --yes", "Skip confirmation prompt", false)
-    .description("Pause subscription or redemption")
+    .description(
+      "Pause subscription or redemption; pausing redemption pauses subscription too",
+    )
     .action(async (action, options) => {
+      // glam_mint's emergency update pauses subscription with redemption.
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           action === "subscription"
@@ -139,9 +157,16 @@ export function installManageCommands(manage: Command, context: CliContext) {
             : context.glamClient.mint.pauseRedemption(context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm pausing ${action}`,
+          message: timelock.confirmAtOnce(
+            action === "subscription"
+              ? "Confirm pausing subscription"
+              : "Confirm pausing redemption. Pausing redemption pauses subscription too, at once",
+          ),
         },
-        (txSig) => `Paused ${action}: ${txSig}`,
+        (txSig) =>
+          action === "subscription"
+            ? `Paused subscription: ${txSig}`
+            : `Paused redemption and subscription: ${txSig}`,
       );
     });
 
@@ -149,8 +174,13 @@ export function installManageCommands(manage: Command, context: CliContext) {
     .command("unpause")
     .argument("<action>", "Action to pause", validateInvestorAction)
     .option("-y, --yes", "Skip confirmation prompt", false)
-    .description("Unpause subscription or redemption")
+    .description(
+      "Unpause subscription or redemption; unpausing redemption unpauses subscription too",
+    )
     .action(async (action, options) => {
+      // glam_mint's emergency update unpauses subscription with redemption,
+      // a subscription paused on its own included.
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           action === "subscription"
@@ -158,9 +188,16 @@ export function installManageCommands(manage: Command, context: CliContext) {
             : context.glamClient.mint.unpauseRedemption(context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm unpausing ${action}`,
+          message: timelock.confirmAtOnce(
+            action === "subscription"
+              ? "Confirm unpausing subscription"
+              : "Confirm unpausing redemption. Unpausing redemption unpauses subscription too, at once, even where subscription was paused on its own",
+          ),
         },
-        (txSig) => `Unpaused ${action}: ${txSig}`,
+        (txSig) =>
+          action === "subscription"
+            ? `Unpaused subscription: ${txSig}`
+            : `Unpaused redemption and subscription: ${txSig}`,
       );
     });
 

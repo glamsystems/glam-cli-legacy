@@ -1,4 +1,8 @@
-import { WSOL, TransferPolicy } from "@glamsystems/glam-sdk";
+import {
+  WSOL,
+  SPL_TOKEN_PROTOCOL,
+  TransferPolicy,
+} from "@glamsystems/glam-sdk";
 import { type Command } from "commander";
 import { PublicKey } from "@solana/web3.js";
 import {
@@ -7,7 +11,26 @@ import {
   printPubkeyList,
   resolveTokenMint,
 } from "../utils";
+import { fail } from "../errors";
 import { parsePositiveUiAmount, validatePublicKey } from "../parsing";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+
+/** The token transfer policy an edit replaces: the staged one under a timelock that holds one. */
+async function transferPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.vault.fetchPolicy(),
+    () => context.glamClient.extSplProgram.programId,
+    SPL_TOKEN_PROTOCOL,
+    TransferPolicy.decode,
+  );
+}
 
 export function installTransferCommands(program: Command, context: CliContext) {
   program
@@ -35,12 +58,12 @@ export function installTransferCommands(program: Command, context: CliContext) {
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a destination address to the token transfer allowlist")
     .action(async (pubkey: PublicKey, options) => {
-      const policy =
-        (await context.glamClient.vault.fetchPolicy()) ??
-        new TransferPolicy([]);
+      const timelock = await readVaultTimelock(context);
+      const base = await transferPolicyToEdit(context, timelock);
+      const policy = base.value ?? new TransferPolicy([]);
       if (policy.allowlist.find((p) => p.equals(pubkey))) {
         console.error(
-          `Destination address ${pubkey} is already in the allowlist.`,
+          `Destination address ${pubkey} is already in the allowlist${base.stagedApart ? " as staged" : ""}.`,
         );
         process.exit(1);
       }
@@ -50,9 +73,16 @@ export function installTransferCommands(program: Command, context: CliContext) {
         () => context.glamClient.vault.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding destination ${pubkey} to allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm adding destination ${pubkey} to allowlist?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the token transfer allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Added destination ${pubkey} to allowlist: ${txSig}`,
+        timelock.outcome(`Added destination ${pubkey} to allowlist`),
       );
     });
 
@@ -68,20 +98,38 @@ export function installTransferCommands(program: Command, context: CliContext) {
       "Remove a destination address from the token transfer allowlist",
     )
     .action(async (pubkey: PublicKey, options) => {
-      const policy = await context.glamClient.vault.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await transferPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("Token transfer policy not found.");
+        console.error(
+          `Token transfer policy not found${base.stagedApart ? " in the staged change" : ""}.`,
+        );
         process.exit(1);
       }
 
+      // The policy would be sent unchanged and the removal reported, under a
+      // timelock restarting the wait of what is staged.
+      if (!policy.allowlist.some((p) => p.equals(pubkey))) {
+        fail(
+          `Destination ${pubkey} is not in the token transfer allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
+      }
       policy.allowlist = policy.allowlist.filter((p) => !p.equals(pubkey));
       await executeTxWithErrorHandling(
         () => context.glamClient.vault.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing destination ${pubkey} from allowlist?`,
+          message: timelock.confirm(
+            [
+              `Confirm removing destination ${pubkey} from allowlist?`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the token transfer allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Removed destination ${pubkey} from allowlist: ${txSig}`,
+        timelock.outcome(`Removed destination ${pubkey} from allowlist`),
       );
     });
 

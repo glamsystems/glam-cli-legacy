@@ -1,8 +1,4 @@
-import {
-  charsToString,
-  getPriorityFeeEstimate,
-  GlamClient,
-} from "@glamsystems/glam-sdk";
+import { charsToString, GlamClient } from "@glamsystems/glam-sdk";
 import { AnchorProvider } from "@coral-xyz/anchor";
 import {
   Connection,
@@ -19,8 +15,14 @@ const { version: cliVersion } = require("../package.json") as {
 
 import {
   CliConfig,
+  describeFees,
   markStagingOnlyCommand,
+  printableText,
+  priorityFeeMicroLamports,
+  priorityFeeSource,
+  recordSentSignatures,
   resolveStagingFromStateOwner,
+  setConfirmationFeeTerms,
   type CliContext,
 } from "./utils";
 import { DEFAULT_DERIVATION_PATH, LedgerWallet } from "./ledger";
@@ -141,34 +143,19 @@ async function initialize(
     transactionVersion: cliConfig.useLedger() ? 0 : undefined,
   });
 
+  recordSentSignatures(context.glamClient);
+
   context.cliConfig = cliConfig;
+  // One reading of the config prices every send and is what each
+  // confirmation shows.
+  const feeSource = priorityFeeSource(cliConfig);
+  setConfirmationFeeTerms(() =>
+    describeFees(feeSource, context.glamClient.signer, `${cluster}`),
+  );
   context.txOptions = {
     simulate: !skipSimulation,
-    getPriorityFeeMicroLamports: async (tx: VersionedTransaction) => {
-      if (
-        context.cliConfig.cluster === "localnet" ||
-        context.cliConfig.cluster === "devnet"
-      ) {
-        return 1_000_000;
-      }
-
-      const { micro_lamports, helius_api_key, level } =
-        context.cliConfig.priority_fee || {};
-
-      // If micro_lamports is provided, use it
-      if (micro_lamports === 0 || micro_lamports) {
-        return micro_lamports;
-      }
-
-      // If helius_api_key is not provided, return 0
-      return helius_api_key
-        ? await getPriorityFeeEstimate({
-            heliusApiKey: helius_api_key,
-            tx,
-            priorityLevel: level,
-          })
-        : 0;
-    },
+    getPriorityFeeMicroLamports: (tx: VersionedTransaction) =>
+      priorityFeeMicroLamports(feeSource, tx),
   };
 }
 
@@ -228,7 +215,10 @@ program
       if (!stateAccount) {
         console.log("Invalid GLAM state account.");
       } else {
-        console.log("Vault name:", charsToString(stateAccount.name));
+        console.log(
+          "Vault name:",
+          printableText(charsToString(stateAccount.name)),
+        );
       }
     } else {
       console.log("No active GLAM vault configured.");

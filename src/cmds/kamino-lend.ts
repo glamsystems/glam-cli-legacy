@@ -1,9 +1,11 @@
 import {
   bfToDecimal,
   Fraction,
+  KAMINO_LENDING_PROTOCOL,
   KaminoLendingPolicy,
   PkMap,
   PkSet,
+  U64_MAX_BN,
 } from "@glamsystems/glam-sdk";
 import { type Command } from "commander";
 import {
@@ -14,12 +16,34 @@ import {
   resolveTokenPublicKey,
 } from "../utils";
 import {
-  parseNonNegativeInteger,
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import { fail } from "../errors";
+import {
   parsePositiveUiAmount,
+  parseUnsignedNumber,
   validatePublicKey,
 } from "../parsing";
 import { PublicKey } from "@solana/web3.js";
 import { Decimal } from "decimal.js";
+
+// Kamino Lending numbers its elevation groups 1 to 32, and 0 leaves them.
+const KAMINO_ELEVATION_GROUPS = 32;
+
+/** The Kamino lending policy an edit replaces: the staged one under a timelock that holds one. */
+async function kaminoLendingPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.kaminoLending.fetchPolicy(),
+    () => context.glamClient.extKaminoProgram.programId,
+    KAMINO_LENDING_PROTOCOL,
+    KaminoLendingPolicy.decode,
+  );
+}
 
 export function installKaminoLendCommands(klend: Command, context: CliContext) {
   klend
@@ -47,11 +71,13 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Add a market to the allowlist")
     .action(async (market, options) => {
-      const policy =
-        (await context.glamClient.kaminoLending.fetchPolicy()) ??
-        new KaminoLendingPolicy([], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await kaminoLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new KaminoLendingPolicy([], []);
       if (policy.marketsAllowlist.find((m) => m.equals(market))) {
-        console.error(`Kamino market ${market} is already in the allowlist`);
+        console.error(
+          `Kamino market ${market} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
 
@@ -61,9 +87,16 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
           context.glamClient.kaminoLending.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding market ${market}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Kamino lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Kamino market ${market} added to allowlist: ${txSig}`,
+        timelock.outcome(`Kamino market ${market} added to allowlist`),
       );
     });
 
@@ -73,13 +106,19 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove a market from the allowlist")
     .action(async (market, options) => {
-      const policy = await context.glamClient.kaminoLending.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await kaminoLendingPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.marketsAllowlist.find((m) => m.equals(market))) {
-        console.error("Market not in allowlist. Removal not needed.");
+        console.error(
+          `Market not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
         process.exit(1);
       }
 
@@ -91,9 +130,16 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
           context.glamClient.kaminoLending.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing market ${market}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Kamino lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Kamino market ${market} removed from allowlist: ${txSig}`,
+        timelock.outcome(`Kamino market ${market} removed from allowlist`),
       );
     });
 
@@ -105,12 +151,14 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
     .description("Add a borrowable token to the allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.kaminoLending.fetchPolicy()) ??
-        new KaminoLendingPolicy([], []);
+      const timelock = await readVaultTimelock(context);
+      const base = await kaminoLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new KaminoLendingPolicy([], []);
 
       if (policy.borrowAllowlist.find((a) => a.equals(token))) {
-        console.error(`Borrowable token ${token} is already in the allowlist`);
+        console.error(
+          `Borrowable token ${token} is already in the allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
         process.exit(1);
       }
 
@@ -120,9 +168,16 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
           context.glamClient.kaminoLending.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding borrowable token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding borrowable token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Kamino lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Borrowable token ${token} added to allowlist: ${txSig}`,
+        timelock.outcome(`Borrowable token ${token} added to allowlist`),
       );
     });
 
@@ -134,13 +189,19 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
     .description("Remove a borrowable token from the allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.kaminoLending.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await kaminoLendingPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.borrowAllowlist.find((a) => a.equals(token))) {
-        console.error("Borrowable token not in allowlist. Removal not needed.");
+        console.error(
+          `Borrowable token not in allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
         process.exit(1);
       }
 
@@ -152,9 +213,16 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
           context.glamClient.kaminoLending.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing borrowable token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing borrowable token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Kamino lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Borrowable token ${token} removed from allowlist: ${txSig}`,
+        timelock.outcome(`Borrowable token ${token} removed from allowlist`),
       );
     });
 
@@ -303,9 +371,17 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
             ),
           {
             skip: options?.yes,
-            message: `Confirm withdrawing ${amount} ${tokenInfo.symbol}`,
+            // Kamino Lending reads u64::MAX as the whole deposit of an
+            // obligation without borrows, and as the most its borrows leave
+            // withdrawable otherwise, which can leave collateral behind.
+            message: amountBN.eq(U64_MAX_BN)
+              ? `Confirm withdrawing the maximum withdrawable ${tokenInfo.symbol} collateral: an amount of u64::MAX, which Kamino Lending reads when the transaction lands as the whole deposit if the obligation has no borrows, and otherwise as the most its borrows leave withdrawable, which can be less than the deposit`
+              : `Confirm withdrawing ${amount} ${tokenInfo.symbol}`,
           },
-          (txSig) => `Withdraw ${amount} ${tokenInfo.symbol}: ${txSig}`,
+          (txSig) =>
+            amountBN.eq(U64_MAX_BN)
+              ? `Withdrew the maximum withdrawable ${tokenInfo.symbol} collateral: ${txSig}`
+              : `Withdraw ${amount} ${tokenInfo.symbol}: ${txSig}`,
         );
       },
     );
@@ -326,6 +402,13 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
           "amount",
         );
         const tokenMint = new PublicKey(tokenInfo.address);
+        // u64::MAX is no amount a reserve lends: Kamino Lending reads it as
+        // everything the obligation can borrow, which the user did not state.
+        if (amountBN.eq(U64_MAX_BN)) {
+          fail(
+            "A Kamino Lending borrow of u64::MAX base units borrows as much as the obligation allows; give the amount to borrow",
+          );
+        }
 
         await executeTxWithErrorHandling(
           () =>
@@ -371,7 +454,10 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
             ),
           {
             skip: options?.yes,
-            message: `Confirm repaying ${amount} ${tokenInfo.symbol}`,
+            // Kamino Lending reads u64::MAX as the whole debt.
+            message: amountBN.eq(U64_MAX_BN)
+              ? `Confirm repaying the whole ${tokenInfo.symbol} debt: an amount of u64::MAX, which Kamino Lending reads as everything owed when the transaction lands`
+              : `Confirm repaying ${amount} ${tokenInfo.symbol}`,
           },
           (txSig) => `Repaid ${amount} ${tokenInfo.symbol}: ${txSig}`,
         );
@@ -381,12 +467,21 @@ export function installKaminoLendCommands(klend: Command, context: CliContext) {
   klend
     .command("request-elevation-group")
     .argument("<market>", "Kamino lending market public key", validatePublicKey)
-    .argument("<elevation-group>", "Elevation group number", (value: string) =>
-      parseNonNegativeInteger(value, "elevation-group"),
+    .argument(
+      "<elevation-group>",
+      `Elevation group number, 1 to ${KAMINO_ELEVATION_GROUPS}, or 0 to leave every group`,
+      // The instruction takes a u8, and Kamino Lending refuses a group past
+      // the last of its 32.
+      (value: string) =>
+        parseUnsignedNumber(value, "elevation-group", KAMINO_ELEVATION_GROUPS),
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Request elevation group for an obligation (staging only)")
     .action(async (market: PublicKey, elevationGroup: number, options) => {
+      if (!context.glamClient.staging) {
+        fail("request-elevation-group is only available on a staging vault");
+      }
+
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.kaminoLending.requestElevationGroup(

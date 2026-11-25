@@ -1,6 +1,7 @@
 import { BN } from "@coral-xyz/anchor";
 import {
   ORCA_WHIRLPOOLS_PROGRAM_ID,
+  ORCA_WHIRLPOOLS_PROTOCOL,
   WSOL,
   WhirlpoolsPolicy,
   fetchMintAndTokenProgram,
@@ -11,6 +12,7 @@ import {
   type OrcaLiquidityV2Accounts,
   type OrcaPriceDeviationAccounts,
   type OrcaPositionAccounts,
+  type OrcaRemainingAccountsInfo,
   type OrcaUpdateFeesAndRewardsAccounts,
   type OrcaV2RemainingAccounts,
   type OpenOrcaPositionWithTokenExtensionsAccounts,
@@ -29,13 +31,20 @@ import {
   printTable,
   resolveTokenPublicKey,
 } from "../utils";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  vaultTimelockOf,
+  type VaultTimelock,
+} from "../staging";
 import { fail } from "../errors";
 import {
   collectPublicKeys,
+  I128_MAX_BN,
   parseInteger,
+  parsePositiveBn,
   parseU8,
   parseU64,
-  parseU128,
   validatePublicKey,
 } from "../parsing";
 
@@ -67,7 +76,12 @@ const WHIRLPOOL_REWARD_INFOS_OFFSET = 269;
 const WHIRLPOOL_REWARD_INFO_SIZE = 128;
 const WHIRLPOOL_REWARD_MINT_OFFSET = 0;
 const WHIRLPOOL_REWARD_VAULT_OFFSET = 32;
-const POSITION_MIN_LEN = 144;
+// A Position account is 216 bytes: the 8-byte discriminator, then its fields.
+const POSITION_MIN_LEN = 216;
+const POSITION_FEE_OWED_A_OFFSET = 112;
+const POSITION_FEE_OWED_B_OFFSET = 136;
+// Each of the three reward infos: a u128 growth checkpoint, then a u64 owed.
+const POSITION_REWARD_OWED_OFFSETS = [160, 184, 208];
 const POSITION_WHIRLPOOL_OFFSET = 8;
 const POSITION_MINT_OFFSET = 40;
 const POSITION_LIQUIDITY_OFFSET = 72;
@@ -89,6 +103,9 @@ type PositionSnapshot = {
   liquidity: bigint;
   tickLowerIndex: number;
   tickUpperIndex: number;
+  feeOwedA: bigint;
+  feeOwedB: bigint;
+  rewardsOwed: bigint[];
 };
 
 type TxOptions = {
@@ -133,15 +150,18 @@ function isKaminoReserveOracleSource(oracleSource: string): boolean {
   return oracleSource === "KaminoReserve";
 }
 
-function parseI32(value: string): number {
-  return parseInteger(value, "value", I32_MIN, I32_MAX);
+function parseI32(label: string): (value: string) => number {
+  return (value) => parseInteger(value, label, I32_MIN, I32_MAX);
 }
 
 function parsePercent(value: string, label: string): number {
   const trimmed = value.trim();
   const pctText = trimmed.endsWith("%") ? trimmed.slice(0, -1).trim() : trimmed;
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(pctText)) {
-    fail(`${label} must be a percentage, e.g. -5% or +10%`);
+    // commander takes a bare -5% for an option and refuses it.
+    fail(
+      `${label} must be a percentage such as -5, 10 or +10%; a value that starts with - and ends with % goes after "--", as in: open-position <whirlpool> -- -5% 10%`,
+    );
   }
 
   const pct = Number(pctText);
@@ -258,7 +278,56 @@ function parsePositionSnapshot(data: Buffer): PositionSnapshot {
     liquidity: readU128LE(data, POSITION_LIQUIDITY_OFFSET, "Position"),
     tickLowerIndex: data.readInt32LE(POSITION_TICK_LOWER_INDEX_OFFSET),
     tickUpperIndex: data.readInt32LE(POSITION_TICK_UPPER_INDEX_OFFSET),
+    feeOwedA: data.readBigUInt64LE(POSITION_FEE_OWED_A_OFFSET),
+    feeOwedB: data.readBigUInt64LE(POSITION_FEE_OWED_B_OFFSET),
+    rewardsOwed: POSITION_REWARD_OWED_OFFSETS.map((offset) =>
+      data.readBigUInt64LE(offset),
+    ),
   };
+}
+
+/**
+ * ext_orca loads the vault's Whirlpools policy for these instructions and
+ * refuses without one (PolicyNotSet). Every one but a decrease also requires
+ * the pool and both its mints on the policy's allowlists.
+ */
+async function requireOrcaPolicy(
+  context: CliContext,
+  command: string,
+  whirlpool: PublicKey,
+  snapshot: WhirlpoolSnapshot,
+  allowlists: boolean,
+): Promise<void> {
+  const policy = await fetchPolicy(context);
+  if (!policy) {
+    fail(
+      `${command} requires an Orca Whirlpools policy, and the vault has none; set one with orca setup-pool ${whirlpool}`,
+    );
+  }
+  if (!allowlists) {
+    return;
+  }
+  if (!policy.whirlpoolsAllowlist.some((key) => key.equals(whirlpool))) {
+    fail(
+      `${command} requires the Whirlpool on the vault's Orca allowlist, and ${whirlpool} is not on it; add it with orca allowlist-whirlpool ${whirlpool}`,
+    );
+  }
+  for (const mint of [snapshot.tokenMintA, snapshot.tokenMintB]) {
+    if (!policy.tokenMintsAllowlist.some((key) => key.equals(mint))) {
+      fail(
+        `${command} requires both token mints of the Whirlpool on the vault's Orca token mint allowlist, and ${mint} is not on it; add it with orca allowlist-token ${mint}`,
+      );
+    }
+  }
+}
+
+/** Liquidity above zero takes some of at least one token at any pool price. */
+function requireATokenMax(command: string, maxA: BN, maxB: BN, labels: string) {
+  if (maxA.isZero() && maxB.isZero()) {
+    fail(
+      `${command} adds liquidity, which takes some of at least one token at any pool price, so ${labels} cannot both be 0`,
+    );
+  }
 }
 
 async function fetchOwnedAccountData(
@@ -662,16 +731,39 @@ async function derivePriceDeviationAccounts(
   };
 }
 
+/**
+ * What an instruction needs of the policy: the allowlists (an increase), the
+ * policy alone (a decrease), or nothing (a fee collection, which sends no
+ * price accounts and which ext_orca checks against no price).
+ */
+type LiquidityUse = {
+  command: string;
+  policy: "allowlists" | "policy" | "none";
+};
+
 async function deriveLiquidityAccounts(
   context: CliContext,
   position: PublicKey,
   options: DerivedPositionOptions,
+  remaining: OrcaV2RemainingAccounts,
+  use: LiquidityUse,
+  knownPosition?: PositionSnapshot,
 ): Promise<OrcaLiquidityV2Accounts> {
-  const positionSnapshot = await fetchPositionSnapshot(context, position);
+  const positionSnapshot =
+    knownPosition ?? (await fetchPositionSnapshot(context, position));
   const whirlpoolSnapshot = await fetchWhirlpoolSnapshot(
     context,
     positionSnapshot.whirlpool,
   );
+  if (use.policy !== "none") {
+    await requireOrcaPolicy(
+      context,
+      use.command,
+      positionSnapshot.whirlpool,
+      whirlpoolSnapshot,
+      use.policy === "allowlists",
+    );
+  }
   const { tokenProgramA, tokenProgramB } = await tokenProgramsForWhirlpool(
     context,
     whirlpoolSnapshot,
@@ -679,7 +771,7 @@ async function deriveLiquidityAccounts(
   );
 
   return {
-    ...parseRemainingOptions(options),
+    ...remaining,
     whirlpool: positionSnapshot.whirlpool,
     position,
     positionMint: positionSnapshot.positionMint,
@@ -690,10 +782,10 @@ async function deriveLiquidityAccounts(
     tokenOwnerAccountB: options.tokenOwnerAccountB,
     tokenVaultA: whirlpoolSnapshot.tokenVaultA,
     tokenVaultB: whirlpoolSnapshot.tokenVaultB,
-    priceDeviationAccounts: await derivePriceDeviationAccounts(
-      context,
-      whirlpoolSnapshot,
-    ),
+    priceDeviationAccounts:
+      use.policy === "none"
+        ? undefined
+        : await derivePriceDeviationAccounts(context, whirlpoolSnapshot),
     tickArrayLower:
       options.tickArrayLower ??
       deriveTickArray(
@@ -790,6 +882,14 @@ function parseRemainingAccounts(raw: string): AccountMeta[] {
     if (!pubkey) {
       fail(`remaining_accounts[${index}] missing pubkey`);
     }
+    // A string such as "false" is truthy and would mark the account. A flag
+    // left out, or given as null, is false.
+    for (const flag of ["isSigner", "isWritable"] as const) {
+      const given: unknown = meta[flag];
+      if (given !== undefined && given !== null && typeof given !== "boolean") {
+        fail(`remaining_accounts[${index}].${flag} must be true or false`);
+      }
+    }
 
     return {
       pubkey: validatePublicKey(pubkey),
@@ -799,20 +899,123 @@ function parseRemainingAccounts(raw: string): AccountMeta[] {
   });
 }
 
+const REMAINING_ACCOUNTS_TYPES = new Set([
+  "transferHookA",
+  "transferHookB",
+  "transferHookReward",
+  "transferHookInput",
+  "transferHookIntermediate",
+  "transferHookOutput",
+  "supplementalTickArrays",
+  "supplementalTickArraysOne",
+  "supplementalTickArraysTwo",
+  "transferHookDepositA",
+  "transferHookDepositB",
+  "transferHookWithdrawalA",
+  "transferHookWithdrawalB",
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// The encoder floors a fractional length, takes a string for its number and
+// writes a slice whose accounts type sits under another key as nothing. It
+// refuses an accounts type it does not know and a length past a u8, but only
+// when the transaction is built, after the confirmation.
+function parseRemainingAccountsInfo(
+  raw: string,
+): OrcaRemainingAccountsInfo | undefined {
+  const label = "remaining_accounts_info";
+  const parsed = loadJson(raw, label);
+  // A JSON null sends no info, like the option left out.
+  if (parsed === null) {
+    return undefined;
+  }
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.slices)) {
+    fail(`${label} must be an object with a slices array`);
+  }
+
+  parsed.slices.forEach((slice: unknown, index: number) => {
+    const type = isPlainObject(slice) ? slice.accountsType : undefined;
+    const variants = isPlainObject(type) ? Object.keys(type) : [];
+    if (variants.length !== 1 || !REMAINING_ACCOUNTS_TYPES.has(variants[0])) {
+      fail(
+        `${label} slices[${index}].accountsType must be an object with one of these keys: ${[...REMAINING_ACCOUNTS_TYPES].join(", ")}`,
+      );
+    }
+    const length = (slice as Record<string, unknown>).length;
+    if (
+      typeof length !== "number" ||
+      !Number.isInteger(length) ||
+      length < 0 ||
+      length > 255
+    ) {
+      fail(`${label} slices[${index}].length must be an integer from 0 to 255`);
+    }
+  });
+  return parsed as OrcaRemainingAccountsInfo;
+}
+
+// The slice types each Whirlpool instruction takes. Its
+// parse_remaining_accounts refuses any other (RemainingAccountsInvalidSlice)
+// and a second non-empty slice of one type
+// (RemainingAccountsDuplicatedAccountsType). Read from orca-so/whirlpools at
+// cc683ec92acb.
+const TRANSFER_HOOKS_A_B = ["transferHookA", "transferHookB"] as const;
+const TRANSFER_HOOK_REWARD = ["transferHookReward"] as const;
+const REPOSITION_TRANSFER_HOOKS = [
+  "transferHookDepositA",
+  "transferHookDepositB",
+  "transferHookWithdrawalA",
+  "transferHookWithdrawalB",
+] as const;
+
 function parseRemainingOptions(
   options: RemainingOptions,
+  command: string,
+  accepted: readonly string[],
 ): OrcaV2RemainingAccounts {
-  return {
-    remainingAccounts: options.remainingAccounts
+  // An option given with an empty value is read, and refused, like any other:
+  // it is not the same as an option left out.
+  const remainingAccounts =
+    options.remainingAccounts !== undefined
       ? parseRemainingAccounts(options.remainingAccounts)
-      : undefined,
-    remainingAccountsInfo: options.remainingAccountsInfo
-      ? (loadJson(
-          options.remainingAccountsInfo,
-          "remaining_accounts_info",
-        ) as never)
-      : undefined,
-  };
+      : undefined;
+  const remainingAccountsInfo =
+    options.remainingAccountsInfo !== undefined
+      ? parseRemainingAccountsInfo(options.remainingAccountsInfo)
+      : undefined;
+  const given = new Set<string>();
+  (remainingAccountsInfo?.slices ?? []).forEach((slice, index) => {
+    const [type] = Object.keys(slice.accountsType);
+    if (!accepted.includes(type)) {
+      fail(
+        `remaining_accounts_info slices[${index}].accountsType ${type} is not one ${command} takes: ${accepted.join(", ")}`,
+      );
+    }
+    if (slice.length > 0) {
+      if (given.has(type)) {
+        fail(
+          `remaining_accounts_info slices[${index}] gives a second slice of ${type} accounts, which ${command} takes once`,
+        );
+      }
+      given.add(type);
+    }
+  });
+  // Whirlpool takes each slice's accounts off the remaining accounts in turn
+  // and refuses the instruction when they run out.
+  const claimed = (remainingAccountsInfo?.slices ?? []).reduce(
+    (total, slice) => total + slice.length,
+    0,
+  );
+  const supplied = remainingAccounts?.length ?? 0;
+  if (claimed > supplied) {
+    fail(
+      `remaining_accounts_info slices take ${claimed} accounts and remaining_accounts gives ${supplied}`,
+    );
+  }
+  return { remainingAccounts, remainingAccountsInfo };
 }
 
 function addRemainingOptions(command: Command): Command {
@@ -893,20 +1096,35 @@ function defaultWhirlpoolsPolicy(): WhirlpoolsPolicy {
   return new WhirlpoolsPolicy([], [], 0);
 }
 
+/** The Whirlpools policy an edit replaces: the staged one under a timelock that holds one. */
+async function whirlpoolsPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => fetchPolicy(context),
+    () => context.glamClient.extOrcaProgram.programId,
+    ORCA_WHIRLPOOLS_PROTOCOL,
+    WhirlpoolsPolicy.decode,
+  );
+}
+
 async function setWhirlpoolsPolicy(
   context: CliContext,
   policy: WhirlpoolsPolicy,
   options: TxOptions,
   message: string,
-  success: (txSig: string) => string,
+  success: string,
+  timelock?: VaultTimelock,
 ) {
+  const vaultTimelock = timelock ?? (await readVaultTimelock(context));
   await executeTxWithErrorHandling(
     () => context.glamClient.orca.setPolicy(policy, context.txOptions),
     {
       skip: !!options.yes,
-      message,
+      message: vaultTimelock.confirm(message),
     },
-    success,
+    vaultTimelock.outcome(success),
   );
 }
 
@@ -915,9 +1133,12 @@ async function updatePolicy(
   mutate: (policy: WhirlpoolsPolicy) => void,
   options: TxOptions,
   message: string,
-  success: (txSig: string) => string,
+  success: string,
 ) {
-  const policy = (await fetchPolicy(context)) ?? defaultWhirlpoolsPolicy();
+  const timelock = await readVaultTimelock(context);
+  const base = await whirlpoolsPolicyToEdit(context, timelock);
+  const created = base.value === null;
+  const policy = base.value ?? defaultWhirlpoolsPolicy();
   mutate(policy);
   policy.whirlpoolsAllowlist = Array.from(
     new PkSet(policy.whirlpoolsAllowlist),
@@ -928,7 +1149,24 @@ async function updatePolicy(
 
   parseMaxDeviationBps(policy.maxDeviationBps.toString());
 
-  await setWhirlpoolsPolicy(context, policy, options, message, success);
+  await setWhirlpoolsPolicy(
+    context,
+    policy,
+    options,
+    [
+      message,
+      ...(created
+        ? [
+            `The vault has no Orca Whirlpools policy; this creates one with max deviation ${policy.maxDeviationBps} bps.`,
+          ]
+        : []),
+      ...(base.stagedApart
+        ? [editsStagedLine("the Orca Whirlpools policy")]
+        : []),
+    ].join("\n"),
+    success,
+    timelock,
+  );
 }
 
 export function installOrcaCommands(orca: Command, context: CliContext) {
@@ -994,13 +1232,22 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           Array.from(new PkSet(tokenMints)),
           options.maxDeviationBps ?? 0,
         );
+        const timelock = await readVaultTimelock(context);
         await executeTxWithErrorHandling(
           () => context.glamClient.orca.setPolicy(policy, context.txOptions),
           {
             skip: !!options.yes,
-            message: "Replace Orca Whirlpools policy?",
+            // The whole policy is written, a max deviation left out as 0.
+            message: timelock.confirm(
+              [
+                "Replace the Orca Whirlpools policy?",
+                `  Whirlpools: ${policy.whirlpoolsAllowlist.join(", ") || "none"}`,
+                `  token mints: ${policy.tokenMintsAllowlist.join(", ") || "none"}`,
+                `  max deviation: ${policy.maxDeviationBps} bps`,
+              ].join("\n"),
+            ),
           },
-          (txSig) => `Orca Whirlpools policy set: ${txSig}`,
+          timelock.outcome("Orca Whirlpools policy set"),
         );
       },
     );
@@ -1015,7 +1262,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         defaultWhirlpoolsPolicy(),
         options,
         "Reset Orca Whirlpools policy to default?",
-        (txSig) => `Orca Whirlpools policy reset: ${txSig}`,
+        `Orca Whirlpools policy reset`,
       );
     });
 
@@ -1036,7 +1283,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         },
         options,
         `Set Orca max deviation to ${maxDeviationBps} bps?`,
-        (txSig) => `Updated Orca max deviation policy: ${txSig}`,
+        `Updated Orca max deviation policy`,
       );
     });
 
@@ -1050,13 +1297,15 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
     .action(async (whirlpool: PublicKey, options: TxOptions) => {
       const snapshot = await fetchWhirlpoolSnapshot(context, whirlpool);
       const state = await context.glamClient.fetchStateAccount();
+      const timelock = vaultTimelockOf(state);
+      const base = timelock.list("assets", state.assets);
       const assets = new PkSet([
-        ...state.assets,
+        ...base.value,
         snapshot.tokenMintA,
         snapshot.tokenMintB,
       ]);
 
-      if (assets.size !== state.assets.length) {
+      if (assets.size !== base.value.length) {
         await executeTxWithErrorHandling(
           () =>
             context.glamClient.state.update(
@@ -1065,9 +1314,16 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Add Whirlpool mints ${snapshot.tokenMintA}, ${snapshot.tokenMintB} to vault assets?`,
+            message: timelock.confirm(
+              [
+                `Add Whirlpool mints ${snapshot.tokenMintA}, ${snapshot.tokenMintB} to vault assets?`,
+                ...(base.stagedApart
+                  ? [editsStagedLine("the vault allowlist")]
+                  : []),
+              ].join("\n"),
+            ),
           },
-          (txSig) => `Vault assets updated for Orca pool: ${txSig}`,
+          timelock.outcome("Vault assets updated for Orca pool"),
         );
       }
 
@@ -1081,8 +1337,8 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           );
         },
         options,
-        `Allowlist Orca pool ${whirlpool} in policy?`,
-        (txSig) => `Orca pool policy updated: ${txSig}`,
+        `Allowlist Orca pool ${whirlpool} and its token mints ${snapshot.tokenMintA}, ${snapshot.tokenMintB} in policy?`,
+        `Orca pool policy updated`,
       );
     });
 
@@ -1116,8 +1372,10 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
             }
           },
           options,
-          `Allowlist Whirlpool ${whirlpool}?`,
-          (txSig) => `Allowlisted Whirlpool ${whirlpool}: ${txSig}`,
+          snapshot
+            ? `Allowlist Whirlpool ${whirlpool} and its token mints ${snapshot.tokenMintA}, ${snapshot.tokenMintB}?`
+            : `Allowlist Whirlpool ${whirlpool}, without its token mints?`,
+          `Allowlisted Whirlpool ${whirlpool}`,
         );
       },
     );
@@ -1137,7 +1395,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         },
         options,
         `Remove Whirlpool ${whirlpool} from allowlist?`,
-        (txSig) => `Removed Whirlpool ${whirlpool}: ${txSig}`,
+        `Removed Whirlpool ${whirlpool}`,
       );
     });
 
@@ -1154,7 +1412,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         (policy) => policy.tokenMintsAllowlist.push(mint),
         options,
         `Allowlist token mint ${mint}?`,
-        (txSig) => `Allowlisted token mint ${mint}: ${txSig}`,
+        `Allowlisted token mint ${mint}`,
       );
     });
 
@@ -1175,7 +1433,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         },
         options,
         `Remove token mint ${mint} from allowlist?`,
-        (txSig) => `Removed token mint ${mint}: ${txSig}`,
+        `Removed token mint ${mint}`,
       );
     });
 
@@ -1229,7 +1487,11 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
   orca
     .command("tick-array-pda")
     .argument("<whirlpool>", "Whirlpool account", validatePublicKey)
-    .argument("<start-tick-index>", "Tick array start tick index", parseI32)
+    .argument(
+      "<start-tick-index>",
+      "Tick array start tick index",
+      parseI32("start-tick-index"),
+    )
     .description("Derive an Orca tick-array PDA")
     .action((whirlpool: PublicKey, startTickIndex: number) => {
       const [tickArray, bump] = context.glamClient.orca.getTickArrayPda(
@@ -1315,6 +1577,13 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           context,
           whirlpool,
         );
+        await requireOrcaPolicy(
+          context,
+          "open-position",
+          whirlpool,
+          whirlpoolSnapshot,
+          true,
+        );
         const anchorTick =
           refPrice === undefined
             ? undefined
@@ -1391,7 +1660,11 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
   orca
     .command("initialize-tick-array")
     .argument("<whirlpool>", "Whirlpool account", validatePublicKey)
-    .argument("<start-tick-index>", "Tick array start tick index", parseI32)
+    .argument(
+      "<start-tick-index>",
+      "Tick array start tick index",
+      parseI32("start-tick-index"),
+    )
     .option(
       "--tick-array <pubkey>",
       "Tick array PDA override",
@@ -1405,6 +1678,27 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         startTickIndex: number,
         options: TxOptions & { tickArray?: PublicKey },
       ) => {
+        const snapshot = await fetchWhirlpoolSnapshot(context, whirlpool);
+        // Whirlpool takes a start that is a multiple of the ticks one array
+        // spans and whose array holds a tick in bounds (InvalidStartTick).
+        const span = TICK_ARRAY_SIZE * snapshot.tickSpacing;
+        if (
+          startTickIndex % span !== 0 ||
+          startTickIndex > ORCA_MAX_TICK_INDEX ||
+          startTickIndex + span <= ORCA_MIN_TICK_INDEX
+        ) {
+          const nearest = Math.floor(startTickIndex / span) * span;
+          fail(
+            `start-tick-index must be a multiple of ${span} (${TICK_ARRAY_SIZE} ticks of spacing ${snapshot.tickSpacing}) whose array holds a tick in [${ORCA_MIN_TICK_INDEX}, ${ORCA_MAX_TICK_INDEX}]; the nearest start at or below ${startTickIndex} is ${nearest}`,
+          );
+        }
+        await requireOrcaPolicy(
+          context,
+          "initialize-tick-array",
+          whirlpool,
+          snapshot,
+          true,
+        );
         await executeTxWithErrorHandling(
           () =>
             context.glamClient.orca.initializeTickArray(
@@ -1414,7 +1708,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
             ),
           {
             skip: !!options.yes,
-            message: `Initialize tick array ${startTickIndex} for ${whirlpool}?`,
+            message: `Initialize tick array ${startTickIndex} for ${whirlpool}, covering ticks [${startTickIndex}, ${startTickIndex + span})?`,
           },
           (txSig) => `Initialized Orca tick array: ${txSig}`,
         );
@@ -1438,22 +1732,49 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       tokenMaxB: string,
       options: TxOptions & DerivedPositionOptions,
     ) => {
+      const remaining = parseRemainingOptions(
+        options,
+        "increase-liquidity-v2",
+        TRANSFER_HOOKS_A_B,
+      );
+      const maxA = parseU64(tokenMaxA, "token-max-a");
+      const maxB = parseU64(tokenMaxB, "token-max-b");
+      requireATokenMax(
+        "increase-liquidity-v2",
+        maxA,
+        maxB,
+        "token-max-a and token-max-b",
+      );
       const params: IncreaseOrcaLiquidityV2Params = {
-        liquidityAmount: parseU128(liquidityAmount, "liquidity-amount"),
-        tokenMaxA: parseU64(tokenMaxA, "token-max-a"),
-        tokenMaxB: parseU64(tokenMaxB, "token-max-b"),
-        ...parseRemainingOptions(options),
+        // Whirlpool refuses a liquidity amount of 0, and one past the i128
+        // it converts the amount to (LiquidityTooHigh).
+        liquidityAmount: parsePositiveBn(
+          liquidityAmount,
+          "liquidity-amount",
+          I128_MAX_BN,
+        ),
+        tokenMaxA: maxA,
+        tokenMaxB: maxB,
+        ...remaining,
       };
+      // The position is read before the confirmation, like any other input.
+      const accounts = await deriveLiquidityAccounts(
+        context,
+        position,
+        options,
+        remaining,
+        { command: "increase-liquidity-v2", policy: "allowlists" },
+      );
       await executeTxWithErrorHandling(
-        async () =>
+        () =>
           context.glamClient.orca.increaseLiquidityV2(
             params,
-            await deriveLiquidityAccounts(context, position, options),
+            accounts,
             context.txOptions,
           ),
         {
           skip: !!options.yes,
-          message: `Increase Orca liquidity for position ${position}?`,
+          message: `Increase Orca liquidity for position ${position} by ${params.liquidityAmount}, paying at most ${params.tokenMaxA} of token A and ${params.tokenMaxB} of token B (raw amounts)?`,
         },
         (txSig) => `Increased Orca liquidity: ${txSig}`,
       );
@@ -1475,6 +1796,19 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       tokenMaxB: string,
       options: TxOptions & DerivedPositionOptions,
     ) => {
+      const maxA = parseU64(tokenMaxA, "token-max-a");
+      const maxB = parseU64(tokenMaxB, "token-max-b");
+      requireATokenMax(
+        "increase-liquidity-by-token-amounts-v2",
+        maxA,
+        maxB,
+        "token-max-a and token-max-b",
+      );
+      const remaining = parseRemainingOptions(
+        options,
+        "increase-liquidity-by-token-amounts-v2",
+        TRANSFER_HOOKS_A_B,
+      );
       const positionSnapshot = await fetchPositionSnapshot(context, position);
       const minSqrtPrice = sqrtPriceFromTickIndex(
         positionSnapshot.tickLowerIndex,
@@ -1482,27 +1816,50 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       const maxSqrtPrice = sqrtPriceFromTickIndex(
         positionSnapshot.tickUpperIndex,
       );
+      // The position's range is sent as the price band, and Whirlpool refuses
+      // the increase while the pool's price is outside it
+      // (PriceSlippageOutOfBounds).
+      const pool = await fetchWhirlpoolSnapshot(
+        context,
+        positionSnapshot.whirlpool,
+      );
+      if (pool.sqrtPrice < minSqrtPrice || pool.sqrtPrice > maxSqrtPrice) {
+        fail(
+          `increase-liquidity-by-token-amounts-v2 sends the position's range [${positionSnapshot.tickLowerIndex}, ${positionSnapshot.tickUpperIndex}) as its price band, and the pool's price, at tick ${Math.floor(currentTickFromSqrtPrice(pool.sqrtPrice))}, is outside it; use increase-liquidity-v2 for a position out of range`,
+        );
+      }
       const params: IncreaseOrcaLiquidityByTokenAmountsV2Params = {
         method: {
           byTokenAmounts: {
-            tokenMaxA: parseU64(tokenMaxA, "token-max-a"),
-            tokenMaxB: parseU64(tokenMaxB, "token-max-b"),
+            tokenMaxA: maxA,
+            tokenMaxB: maxB,
             minSqrtPrice: new BN(minSqrtPrice.toString()),
             maxSqrtPrice: new BN(maxSqrtPrice.toString()),
           },
         },
-        ...parseRemainingOptions(options),
+        ...remaining,
       };
+      const accounts = await deriveLiquidityAccounts(
+        context,
+        position,
+        options,
+        remaining,
+        {
+          command: "increase-liquidity-by-token-amounts-v2",
+          policy: "allowlists",
+        },
+        positionSnapshot,
+      );
       await executeTxWithErrorHandling(
-        async () =>
+        () =>
           context.glamClient.orca.increaseLiquidityByTokenAmountsV2(
             params,
-            await deriveLiquidityAccounts(context, position, options),
+            accounts,
             context.txOptions,
           ),
         {
           skip: !!options.yes,
-          message: `Increase Orca liquidity by token amounts for position ${position} using ticks [${positionSnapshot.tickLowerIndex}, ${positionSnapshot.tickUpperIndex})?`,
+          message: `Increase Orca liquidity by token amounts for position ${position} using ticks [${positionSnapshot.tickLowerIndex}, ${positionSnapshot.tickUpperIndex}), paying at most ${maxA} of token A and ${maxB} of token B (raw amounts), only while the pool's price stays within those ticks?`,
         },
         (txSig) => `Increased Orca liquidity by token amounts: ${txSig}`,
       );
@@ -1526,22 +1883,50 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       tokenMinB: string,
       options: TxOptions & DerivedPositionOptions,
     ) => {
+      const remaining = parseRemainingOptions(
+        options,
+        "decrease-liquidity-v2",
+        TRANSFER_HOOKS_A_B,
+      );
       const params: DecreaseOrcaLiquidityV2Params = {
-        liquidityAmount: parseU128(liquidityAmount, "liquidity-amount"),
+        // Whirlpool refuses a liquidity amount of 0, and one past the i128
+        // it converts the amount to (LiquidityTooHigh).
+        liquidityAmount: parsePositiveBn(
+          liquidityAmount,
+          "liquidity-amount",
+          I128_MAX_BN,
+        ),
         tokenMinA: parseU64(tokenMinA, "token-min-a"),
         tokenMinB: parseU64(tokenMinB, "token-min-b"),
-        ...parseRemainingOptions(options),
+        ...remaining,
       };
+      const positionSnapshot = await fetchPositionSnapshot(context, position);
+      // A position cannot give up more liquidity than it holds.
+      if (
+        BigInt(params.liquidityAmount.toString()) > positionSnapshot.liquidity
+      ) {
+        fail(
+          `decrease-liquidity-v2 takes at most the position's liquidity, ${positionSnapshot.liquidity}, and liquidity-amount is ${params.liquidityAmount}`,
+        );
+      }
+      const accounts = await deriveLiquidityAccounts(
+        context,
+        position,
+        options,
+        remaining,
+        { command: "decrease-liquidity-v2", policy: "policy" },
+        positionSnapshot,
+      );
       await executeTxWithErrorHandling(
-        async () =>
+        () =>
           context.glamClient.orca.decreaseLiquidityV2(
             params,
-            await deriveLiquidityAccounts(context, position, options),
+            accounts,
             context.txOptions,
           ),
         {
           skip: !!options.yes,
-          message: `Decrease Orca liquidity for position ${position}?`,
+          message: `Decrease Orca liquidity for position ${position} by ${params.liquidityAmount}, receiving at least ${params.tokenMinA} of token A and ${params.tokenMinB} of token B (raw amounts)?`,
         },
         (txSig) => `Decreased Orca liquidity: ${txSig}`,
       );
@@ -1553,8 +1938,16 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       orca
         .command("reposition-liquidity-v2")
         .argument("<position>", "Orca position account", validatePublicKey)
-        .argument("<new-tick-lower-index>", "New lower tick index", parseI32)
-        .argument("<new-tick-upper-index>", "New upper tick index", parseI32)
+        .argument(
+          "<new-tick-lower-index>",
+          "New lower tick index",
+          parseI32("new-tick-lower-index"),
+        )
+        .argument(
+          "<new-tick-upper-index>",
+          "New upper tick index",
+          parseI32("new-tick-upper-index"),
+        )
         .argument("<new-liquidity-amount>", "New liquidity amount")
         .argument("<existing-range-token-min-a>", "Existing range min token A")
         .argument("<existing-range-token-min-b>", "Existing range min token B")
@@ -1620,11 +2013,89 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           newTickArrayUpper?: PublicKey;
         },
     ) => {
+      if (newTickLowerIndex >= newTickUpperIndex) {
+        fail("new-tick-lower-index must be less than new-tick-upper-index");
+      }
+      // Whirlpool's interface names what it refuses here: a liquidity amount
+      // of 0 or past the i128 it converts the amount to, a tick out of
+      // bounds, out of order or off the pool's tick spacing, and the range
+      // the position already has.
+      const byLiquidity = {
+        newLiquidityAmount: parsePositiveBn(
+          newLiquidityAmount,
+          "new-liquidity-amount",
+          I128_MAX_BN,
+        ),
+        existingRangeTokenMinA: parseU64(
+          existingRangeTokenMinA,
+          "existing-range-token-min-a",
+        ),
+        existingRangeTokenMinB: parseU64(
+          existingRangeTokenMinB,
+          "existing-range-token-min-b",
+        ),
+        newRangeTokenMaxA: parseU64(newRangeTokenMaxA, "new-range-token-max-a"),
+        newRangeTokenMaxB: parseU64(newRangeTokenMaxB, "new-range-token-max-b"),
+      };
+      const remaining = parseRemainingOptions(
+        options,
+        "reposition-liquidity-v2",
+        REPOSITION_TRANSFER_HOOKS,
+      );
+
+      requireATokenMax(
+        "reposition-liquidity-v2",
+        byLiquidity.newRangeTokenMaxA,
+        byLiquidity.newRangeTokenMaxB,
+        "new-range-token-max-a and new-range-token-max-b",
+      );
       const positionSnapshot = await fetchPositionSnapshot(context, position);
+      // An empty position returns no tokens from its range.
+      if (
+        positionSnapshot.liquidity === 0n &&
+        !(
+          byLiquidity.existingRangeTokenMinA.isZero() &&
+          byLiquidity.existingRangeTokenMinB.isZero()
+        )
+      ) {
+        fail(
+          `Position ${position} holds no liquidity, so its existing range returns no tokens: existing-range-token-min-a and existing-range-token-min-b must be 0`,
+        );
+      }
       const whirlpoolSnapshot = await fetchWhirlpoolSnapshot(
         context,
         positionSnapshot.whirlpool,
       );
+      await requireOrcaPolicy(
+        context,
+        "reposition-liquidity-v2",
+        positionSnapshot.whirlpool,
+        whirlpoolSnapshot,
+        true,
+      );
+      if (
+        newTickLowerIndex === positionSnapshot.tickLowerIndex &&
+        newTickUpperIndex === positionSnapshot.tickUpperIndex
+      ) {
+        fail(
+          `the new tick range [${newTickLowerIndex}, ${newTickUpperIndex}) is the position's current range`,
+        );
+      }
+      // A position's ticks are ticks the pool can initialize, as open-position
+      // derives them: multiples of its tick spacing inside the tick range.
+      const { tickSpacing } = whirlpoolSnapshot;
+      const lowest = minInitializableTick(tickSpacing);
+      const highest = maxInitializableTick(tickSpacing);
+      for (const [label, tick] of [
+        ["new-tick-lower-index", newTickLowerIndex],
+        ["new-tick-upper-index", newTickUpperIndex],
+      ] as const) {
+        if (tick < lowest || tick > highest || tick % tickSpacing !== 0) {
+          fail(
+            `${label} must be a multiple of the pool's tick spacing ${tickSpacing} in [${lowest}, ${highest}]`,
+          );
+        }
+      }
       const { tokenProgramA, tokenProgramB } = await tokenProgramsForWhirlpool(
         context,
         whirlpoolSnapshot,
@@ -1633,34 +2104,11 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       const params: RepositionOrcaLiquidityV2Params = {
         newTickLowerIndex,
         newTickUpperIndex,
-        method: {
-          byLiquidity: {
-            newLiquidityAmount: parseU128(
-              newLiquidityAmount,
-              "new-liquidity-amount",
-            ),
-            existingRangeTokenMinA: parseU64(
-              existingRangeTokenMinA,
-              "existing-range-token-min-a",
-            ),
-            existingRangeTokenMinB: parseU64(
-              existingRangeTokenMinB,
-              "existing-range-token-min-b",
-            ),
-            newRangeTokenMaxA: parseU64(
-              newRangeTokenMaxA,
-              "new-range-token-max-a",
-            ),
-            newRangeTokenMaxB: parseU64(
-              newRangeTokenMaxB,
-              "new-range-token-max-b",
-            ),
-          },
-        },
-        ...parseRemainingOptions(options),
+        method: { byLiquidity },
+        ...remaining,
       };
       const accounts: RepositionOrcaLiquidityV2Accounts = {
-        ...parseRemainingOptions(options),
+        ...remaining,
         whirlpool: positionSnapshot.whirlpool,
         position,
         positionMint: positionSnapshot.positionMint,
@@ -1721,7 +2169,7 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           ),
         {
           skip: !!options.yes,
-          message: `Reposition Orca liquidity for position ${position}?`,
+          message: `Reposition Orca liquidity for position ${position} from ticks [${positionSnapshot.tickLowerIndex}, ${positionSnapshot.tickUpperIndex}), which hold ${positionSnapshot.liquidity} of liquidity, to ticks [${newTickLowerIndex}, ${newTickUpperIndex}) with liquidity ${byLiquidity.newLiquidityAmount}: at least ${byLiquidity.existingRangeTokenMinA} of token A and ${byLiquidity.existingRangeTokenMinB} of token B out of the existing range, at most ${byLiquidity.newRangeTokenMaxA} of token A and ${byLiquidity.newRangeTokenMaxB} of token B into the new one (raw amounts)?`,
         },
         (txSig) => `Repositioned Orca liquidity: ${txSig}`,
       );
@@ -1799,12 +2247,17 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
       position: PublicKey,
       options: TxOptions & DerivedPositionOptions,
     ) => {
+      // The position and the JSON options are read before the confirmation.
+      const accounts = await deriveLiquidityAccounts(
+        context,
+        position,
+        options,
+        parseRemainingOptions(options, "collect-fees-v2", TRANSFER_HOOKS_A_B),
+        { command: "collect-fees-v2", policy: "none" },
+      );
       await executeTxWithErrorHandling(
-        async () =>
-          context.glamClient.orca.collectFeesV2(
-            await deriveLiquidityAccounts(context, position, options),
-            context.txOptions,
-          ),
+        () =>
+          context.glamClient.orca.collectFeesV2(accounts, context.txOptions),
         {
           skip: !!options.yes,
           message: `Collect Orca fees for position ${position}?`,
@@ -1871,7 +2324,11 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
           )
         ).tokenProgram;
       const accounts: CollectOrcaRewardV2Accounts = {
-        ...parseRemainingOptions(options),
+        ...parseRemainingOptions(
+          options,
+          "collect-reward-v2",
+          TRANSFER_HOOK_REWARD,
+        ),
         whirlpool: positionSnapshot.whirlpool,
         position,
         positionMint: positionSnapshot.positionMint,
@@ -1914,6 +2371,30 @@ export function installOrcaCommands(orca: Command, context: CliContext) {
         options: TxOptions & { positionTokenAccount?: PublicKey },
       ) => {
         const positionSnapshot = await fetchPositionSnapshot(context, position);
+        // Whirlpool closes only an empty position: no liquidity, no fees
+        // owed and no rewards owed (ClosePositionNotEmpty).
+        const held = [
+          ...(positionSnapshot.liquidity > 0n
+            ? [
+                `${positionSnapshot.liquidity} of liquidity (decrease-liquidity-v2)`,
+              ]
+            : []),
+          ...(positionSnapshot.feeOwedA > 0n || positionSnapshot.feeOwedB > 0n
+            ? [
+                `fees owed of ${positionSnapshot.feeOwedA} of token A and ${positionSnapshot.feeOwedB} of token B (collect-fees-v2)`,
+              ]
+            : []),
+          ...positionSnapshot.rewardsOwed.flatMap((owed, index) =>
+            owed > 0n
+              ? [`${owed} of reward ${index} owed (collect-reward-v2 ${index})`]
+              : [],
+          ),
+        ];
+        if (held.length > 0) {
+          fail(
+            `Whirlpool closes only an empty position, and ${position} holds ${held.join(", ")}`,
+          );
+        }
         const accounts: OrcaPositionAccounts = {
           whirlpool: positionSnapshot.whirlpool,
           position,

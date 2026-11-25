@@ -1,8 +1,9 @@
 import { type Command } from "commander";
 import { type CliContext, executeTxWithErrorHandling } from "../utils";
+import { describeDuration, readVaultTimelock } from "../staging";
 import { stagedRouteChanges } from "./bridge";
 import { type PublicKey } from "@solana/web3.js";
-import { parseNonNegativeInteger } from "../parsing";
+import { parseU32 } from "../parsing";
 import {
   type IntegrationAcl,
   type DelegateAcl,
@@ -260,18 +261,29 @@ export function installTimelockCommands(program: Command, context: CliContext) {
   program
     .command("set")
     .argument("<duration>", "Timelock duration in seconds", (value) =>
-      parseNonNegativeInteger(value, "duration"),
+      parseU32(value, "duration"),
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Set timelock duration")
-    .action(async (duration, { yes }) => {
+    .action(async (duration: number, { yes }) => {
+      const timelock = await readVaultTimelock(context);
+      const question = `Set timelock to ${describeDuration(duration)}?`;
+      // Without a timelock the new duration applies at once, and from then on
+      // every owner change waits for it, a shorter timelock included.
+      const message = timelock.active
+        ? timelock.confirm(
+            `${question} Until it is applied, the current timelock of ${describeDuration(timelock.duration)} stays in force.`,
+          )
+        : duration > 0
+          ? `${question} The vault has no timelock, so this applies at once. From then on every owner change waits ${duration} seconds after it lands before it can be applied, a change of this timelock included.`
+          : question;
       await executeTxWithErrorHandling(
         () => context.glamClient.timelock.set(duration, context.txOptions),
         {
           skip: yes,
-          message: `Set timelock to ${duration} seconds?`,
+          message,
         },
-        (txSig) => `Timelock updated: ${txSig}`,
+        timelock.outcome("Timelock updated"),
       );
     });
 

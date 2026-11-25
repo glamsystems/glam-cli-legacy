@@ -33,15 +33,15 @@
     "templates/**/*.json"
   ],
   "dependencies": {
-    "@ellipsis-labs/rise": "0.4.66",
-    "@glamsystems/glam-sdk": "1.2.1",
+    "@ellipsis-labs/rise": "0.4.78",
+    "@glamsystems/glam-sdk": "1.2.2",
     "bigint-buffer": "npm:@exodus/bigint-buffer@1.1.5-exodus.1",
-    "commander": "11.1.0",
+    "commander": "15.1.0",
     "decimal.js": "10.6.0",
-    "inquirer": "8.2.7"
+    "inquirer": "14.3.0"
   },
   "optionalDependencies": {
-    "@ledgerhq/hw-app-solana": "7.10.1",
+    "@ledgerhq/hw-app-solana": "7.13.0",
     "@ledgerhq/hw-transport-node-hid": "6.33.1"
   },
   "devDependencies": {
@@ -55,11 +55,9 @@
   },
   "overrides": {
     "bigint-buffer@1.1.5": "npm:@exodus/bigint-buffer@1.1.5-exodus.1",
-    "anchor-bankrun": "0.4.0",
-    "solana-bankrun": "0.4.0",
     "@coral-xyz/anchor": "0.31.1",
     "@solana/web3.js": "1.99.0",
-    "@solana/spl-token": "0.4.13",
+    "@solana/spl-token": "0.4.15",
     "@solana/spl-stake-pool": "1.1.8",
     "typescript": "$typescript",
     "bn.js@>=5.0.0 <5.2.5": "5.2.5",

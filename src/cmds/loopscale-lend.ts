@@ -19,9 +19,15 @@ import {
   executeTxWithErrorHandling,
   printPubkeyList,
   printTable,
+  formatUiAmount,
   resolveTokenMint,
   resolveTokenPublicKey,
 } from "../utils";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
 import { fail } from "../errors";
 import {
   parseBps,
@@ -31,6 +37,7 @@ import {
   parseNonNegativeUiAmount,
   parsePositiveUiAmount,
   parseUnsignedNumber,
+  requireSafeIntegerAmount,
   validatePublicKey,
 } from "../parsing";
 import {
@@ -42,7 +49,25 @@ import {
   resolveCollateralAssetList,
   resolveOptionalTokenList,
   strategyTermRows,
+  collateralTermLines,
+  keysText,
+  lendingMarketFields,
+  marketFieldLines,
+  MARKET_LIMITS_CLEARED,
 } from "./loopscale-borrow";
+
+/** The Loopscale lending policy an edit replaces: the staged one under a timelock that holds one. */
+async function loopscaleLendingPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.loopscaleLend.fetchPolicy(),
+    () => context.glamClient.loopscaleLend.programId,
+    LOOPSCALE_LENDING_PROTOCOL,
+    LoopscaleLendingPolicy.decode,
+  );
+}
 
 export function installLoopscaleLendCommands(
   loopscaleLend: Command,
@@ -268,14 +293,23 @@ export function installLoopscaleLendCommands(
         new LoopscaleSellLedgerPolicy(maxDiscountBps, maxSlippageBps),
       );
 
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: "Confirm replacing Loopscale lending policy",
+          message: timelock.confirm(
+            [
+              "Confirm replacing Loopscale lending policy",
+              `  principal allowlist: ${keysText(principalAllowlist, "all strategy creation, updates, deposits and ledger sales")}`,
+              `  collateral allowlist: ${keysText(collateralAllowlist, "every strategy collateral asset")}`,
+              `  sell-ledger limits: max discount ${maxDiscountBps} bps${maxDiscountBps === 0 ? " (requires no discount)" : ""}, max slippage ${maxSlippageBps} bps${maxSlippageBps === 0 ? " (allows no slippage)" : ""}`,
+              MARKET_LIMITS_CLEARED,
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Loopscale lending policy replaced: ${txSig}`,
+        timelock.outcome("Loopscale lending policy replaced"),
       );
     });
 
@@ -286,6 +320,7 @@ export function installLoopscaleLendCommands(
       "Reset Loopscale lending policy to an empty default without decoding the existing policy",
     )
     .action(async (options) => {
+      const timelock = await readVaultTimelock(context);
       await executeTxWithErrorHandling(
         () =>
           context.glamClient.loopscaleLend.setPolicy(
@@ -294,9 +329,11 @@ export function installLoopscaleLendCommands(
           ),
         {
           skip: options?.yes,
-          message: "Confirm resetting Loopscale lending policy",
+          message: timelock.confirm(
+            "Confirm resetting Loopscale lending policy",
+          ),
         },
-        (txSig) => `Loopscale lending policy reset: ${txSig}`,
+        timelock.outcome("Loopscale lending policy reset"),
       );
     });
 
@@ -307,11 +344,13 @@ export function installLoopscaleLendCommands(
     .description("Add a principal token to the lending allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.loopscaleLend.fetchPolicy()) ??
-        new LoopscaleLendingPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleLendingPolicy();
       if (policy.principalAllowlist.find((m) => m.equals(token))) {
-        fail(`Principal token ${token} is already in the lending allowlist`);
+        fail(
+          `Principal token ${token} is already in the lending allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.principalAllowlist.push(token);
@@ -320,10 +359,16 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding lending principal token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding lending principal token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Lending principal token ${token} added to allowlist: ${txSig}`,
+        timelock.outcome(`Lending principal token ${token} added to allowlist`),
       );
     });
 
@@ -334,12 +379,18 @@ export function installLoopscaleLendCommands(
     .description("Remove a principal token from the lending allowlist")
     .action(async (tokenInput: string, options) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.loopscaleLend.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No lending policy found");
+        fail(
+          `No lending policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.principalAllowlist.find((m) => m.equals(token))) {
-        fail("Principal token not in lending allowlist. Removal not needed.");
+        fail(
+          `Principal token not in lending allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
       policy.principalAllowlist = policy.principalAllowlist.filter(
@@ -350,10 +401,18 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing lending principal token ${token}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing lending principal token ${token}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Lending principal token ${token} removed from allowlist: ${txSig}`,
+        timelock.outcome(
+          `Lending principal token ${token} removed from allowlist`,
+        ),
       );
     });
 
@@ -364,11 +423,13 @@ export function installLoopscaleLendCommands(
     .description("Add a collateral asset to the lending allowlist")
     .action(async (assetInput: string, options) => {
       const asset = await resolveTokenPublicKey(context.glamClient, assetInput);
-      const policy =
-        (await context.glamClient.loopscaleLend.fetchPolicy()) ??
-        new LoopscaleLendingPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleLendingPolicy();
       if (policy.collateralAllowlist.find((m) => m.equals(asset))) {
-        fail(`Collateral asset ${asset} is already in the lending allowlist`);
+        fail(
+          `Collateral asset ${asset} is already in the lending allowlist${base.stagedApart ? " as staged" : ""}`,
+        );
       }
 
       policy.collateralAllowlist.push(asset);
@@ -377,10 +438,18 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm adding lending collateral asset ${asset}`,
+          message: timelock.confirm(
+            [
+              `Confirm adding lending collateral asset ${asset}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Lending collateral asset ${asset} added to allowlist: ${txSig}`,
+        timelock.outcome(
+          `Lending collateral asset ${asset} added to allowlist`,
+        ),
       );
     });
 
@@ -391,12 +460,18 @@ export function installLoopscaleLendCommands(
     .description("Remove a collateral asset from the lending allowlist")
     .action(async (assetInput: string, options) => {
       const asset = await resolveTokenPublicKey(context.glamClient, assetInput);
-      const policy = await context.glamClient.loopscaleLend.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No lending policy found");
+        fail(
+          `No lending policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.collateralAllowlist.find((m) => m.equals(asset))) {
-        fail("Collateral asset not in lending allowlist. Removal not needed.");
+        fail(
+          `Collateral asset not in lending allowlist${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
       policy.collateralAllowlist = policy.collateralAllowlist.filter(
@@ -407,10 +482,18 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing lending collateral asset ${asset}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing lending collateral asset ${asset}`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Lending collateral asset ${asset} removed from allowlist: ${txSig}`,
+        timelock.outcome(
+          `Lending collateral asset ${asset} removed from allowlist`,
+        ),
       );
     });
 
@@ -470,9 +553,9 @@ export function installLoopscaleLendCommands(
         options.collateralAssets,
       );
 
-      const policy =
-        (await context.glamClient.loopscaleLend.fetchPolicy()) ??
-        new LoopscaleLendingPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleLendingPolicy();
       const marketPolicy = new LoopscaleLendingMarketPolicy(
         market,
         maxDepositAmount,
@@ -486,6 +569,10 @@ export function installLoopscaleLendCommands(
         p.market.equals(market),
       );
       const action = existingIndex >= 0 ? "updated" : "added";
+      const previous =
+        existingIndex >= 0
+          ? lendingMarketFields(policy.marketPolicies[existingIndex])
+          : undefined;
       if (existingIndex >= 0) {
         policy.marketPolicies[existingIndex] = marketPolicy;
       } else {
@@ -497,9 +584,17 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm ${action === "updated" ? "updating" : "adding"} lending market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm ${action === "updated" ? "updating" : "adding"} lending market ${market}`,
+              ...marketFieldLines(lendingMarketFields(marketPolicy), previous),
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Lending market ${market} ${action}: ${txSig}`,
+        timelock.outcome(`Lending market ${market} ${action}`),
       );
     });
 
@@ -513,14 +608,23 @@ export function installLoopscaleLendCommands(
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Remove optional advanced risk limits for a lending market")
     .action(async (market: PublicKey, options) => {
-      const policy = await context.glamClient.loopscaleLend.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        fail("No lending policy found");
+        fail(
+          `No lending policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
       }
       if (!policy.marketPolicies.find((p) => p.market.equals(market))) {
-        fail("Market not in lending policy. Removal not needed.");
+        fail(
+          `Market not in lending policy${base.stagedApart ? " as staged" : ""}. Removal not needed.`,
+        );
       }
 
+      const removed = policy.marketPolicies.find((p) =>
+        p.market.equals(market),
+      )!;
       policy.marketPolicies = policy.marketPolicies.filter(
         (p) => !p.market.equals(market),
       );
@@ -529,9 +633,18 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: `Confirm removing lending market ${market}`,
+          message: timelock.confirm(
+            [
+              `Confirm removing the limits of lending market ${market}:`,
+              ...marketFieldLines(lendingMarketFields(removed)),
+              "The market stays usable under the principal and collateral allowlists, with no per-market limit.",
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Lending market ${market} removed: ${txSig}`,
+        timelock.outcome(`Limits of lending market ${market} removed`),
       );
     });
 
@@ -557,9 +670,9 @@ export function installLoopscaleLendCommands(
         "max-slippage-bps",
       );
 
-      const policy =
-        (await context.glamClient.loopscaleLend.fetchPolicy()) ??
-        new LoopscaleLendingPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await loopscaleLendingPolicyToEdit(context, timelock);
+      const policy = base.value ?? new LoopscaleLendingPolicy();
       policy.sellLedgerPolicy = new LoopscaleSellLedgerPolicy(
         maxDiscountBps,
         maxSlippageBps,
@@ -570,9 +683,16 @@ export function installLoopscaleLendCommands(
           context.glamClient.loopscaleLend.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes,
-          message: "Confirm updating sell-ledger limits",
+          message: timelock.confirm(
+            [
+              "Confirm updating sell-ledger limits",
+              ...(base.stagedApart
+                ? [editsStagedLine("the Loopscale lending policy")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Sell-ledger limits updated: ${txSig}`,
+        timelock.outcome("Sell-ledger limits updated"),
       );
     });
 
@@ -649,10 +769,25 @@ export function installLoopscaleLendCommands(
           marketInfo.principalMint.toBase58(),
         );
         const principalMint = new PublicKey(address);
-        const depositAmount = parsePositiveUiAmount(amount, decimals);
-        const originationCap = options.originationCap
-          ? parseNonNegativeUiAmount(options.originationCap, decimals)
-          : depositAmount;
+        const depositAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
+        // An empty value is read, and refused, like any other: only an option
+        // left out takes the deposit amount as the cap.
+        const originationCap =
+          options.originationCap !== undefined
+            ? requireSafeIntegerAmount(
+                parseNonNegativeUiAmount(
+                  options.originationCap,
+                  decimals,
+                  "origination-cap",
+                ),
+                "origination-cap",
+                "the Loopscale API",
+              )
+            : depositAmount;
         const liquidityBuffer = parseCbps(
           liquidityBufferCbps,
           "liquidity-buffer-cbps",
@@ -716,7 +851,11 @@ export function installLoopscaleLendCommands(
               `principal: ${principalLabel}`,
               `origination cap: ${originationCap.toString()} base units`,
               `liquidity buffer: ${liquidityBuffer.toString()} cBPS`,
+              `interest fee: ${interestFee.toString()} cBPS`,
+              `origination fee: ${originationFee.toString()} cBPS`,
               `originations enabled: ${enableOriginations}`,
+              // The terms decide the rate at which the deposit is lent.
+              ...collateralTermLines(marketInfo, collateralTerms),
             ].join("\n"),
           },
           (txSig) =>
@@ -738,7 +877,10 @@ export function installLoopscaleLendCommands(
       (value, previous: string[] = []) => [...previous, value],
       [],
     )
-    .option("--originations-enabled", "Enable or disable new originations")
+    // Both forms declared: commander then leaves the value unset unless one
+    // is given, and gives a lone flag no way to say false.
+    .option("--originations-enabled", "Enable new originations")
+    .option("--no-originations-enabled", "Disable new originations")
     .option(
       "--origination-cap <amount>",
       "Maximum principal amount to originate",
@@ -749,7 +891,11 @@ export function installLoopscaleLendCommands(
     .option("--principal-fee-cbps <n>", "Principal fee in cBPS")
     .option(
       "--external-yield-enabled",
-      "Enable or disable Loopscale external yield source",
+      "Enable the Loopscale external yield source, and new originations with it",
+    )
+    .option(
+      "--no-external-yield-enabled",
+      "Disable the Loopscale external yield source, once the strategy holds no external yield",
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Update a Loopscale lender strategy")
@@ -772,6 +918,11 @@ export function installLoopscaleLendCommands(
           originationsEnabled, // true: enable, false: disable, undefined: no change
           externalYieldEnabled, // true: enable, false: disable, undefined: no change
         } = options;
+        if (externalYieldEnabled === true && originationsEnabled === false) {
+          fail(
+            "--external-yield-enabled enables new originations as well, so it cannot be given with --no-originations-enabled",
+          );
+        }
 
         const { strategy: strategyAccount, marketInfo } =
           await context.glamClient.loopscaleLend.fetchOwnedStrategyWithMarket(
@@ -865,18 +1016,7 @@ export function installLoopscaleLendCommands(
           changeLines.push("external yield source: 0");
         }
 
-        if (collateralTerms.length > 0) {
-          for (const term of collateralTerms) {
-            changeLines.push(
-              `collateral terms apy=${term.apy.toString()} cBPS indices=${term.indices
-                .map(
-                  ({ collateralIndex, durationIndex }) =>
-                    `${collateralIndex}:${durationIndex}`,
-                )
-                .join(",")}`,
-            );
-          }
-        }
+        changeLines.push(...collateralTermLines(marketInfo, collateralTerms));
 
         const hasParams = Object.keys(params).length > 0;
         const apiCollateralTerms = buildLoopscaleApiCollateralTermUpdates(
@@ -934,7 +1074,11 @@ export function installLoopscaleLendCommands(
           context.glamClient.connection,
           marketInfo.principalMint,
         );
-        const depositAmount = parsePositiveUiAmount(amount, mint.decimals);
+        const depositAmount = requireSafeIntegerAmount(
+          parsePositiveUiAmount(amount, mint.decimals, "amount"),
+          "amount",
+          "the Loopscale API",
+        );
 
         await executeTxWithErrorHandling(
           () =>
@@ -974,8 +1118,9 @@ export function installLoopscaleLendCommands(
         amount: string,
         options: { yes: boolean },
       ) => {
-        const { principalMint, marketInformation } =
+        const strategyAccount =
           await context.glamClient.loopscaleLend.fetchOwnedStrategy(strategy);
+        const { principalMint, marketInformation } = strategyAccount;
 
         const { mint } = await fetchMintAndTokenProgram(
           context.glamClient.connection,
@@ -984,7 +1129,26 @@ export function installLoopscaleLendCommands(
         const withdrawAll = amount === "all";
         const withdrawAmount = withdrawAll
           ? new BN(0)
-          : parsePositiveUiAmount(amount!, mint.decimals);
+          : requireSafeIntegerAmount(
+              parsePositiveUiAmount(amount, mint.decimals, "amount"),
+              "amount",
+              "the Loopscale API",
+            );
+        // 'all' takes the strategy's token balance and leaves its external
+        // yield, which only an amount reaches; the SDK refuses either case
+        // past what the strategy holds, after the confirmation.
+        const { tokenBalance, externalYieldAmount } = strategyAccount;
+        if (withdrawAll && tokenBalance.isZero()) {
+          fail(
+            `withdraw-strategy all takes the strategy's undeployed principal, and its token balance is 0${externalYieldAmount.isZero() ? "" : `; give an amount to withdraw its ${formatUiAmount(externalYieldAmount, mint.decimals)} of external yield`}`,
+          );
+        }
+        const withdrawable = tokenBalance.add(externalYieldAmount);
+        if (!withdrawAll && withdrawAmount.gt(withdrawable)) {
+          fail(
+            `withdraw-strategy takes at most the strategy's token balance and external yield, ${formatUiAmount(withdrawable, mint.decimals)}, and amount is ${amount}`,
+          );
+        }
 
         await executeTxWithErrorHandling(
           () =>
@@ -1004,7 +1168,14 @@ export function installLoopscaleLendCommands(
               "Confirm Loopscale withdraw-strategy",
               `strategy: ${strategy}`,
               `principal mint: ${principalMint}`,
-              withdrawAll ? "amount: all" : `amount: ${amount}`,
+              withdrawAll
+                ? `amount: all of the token balance, ${formatUiAmount(tokenBalance, mint.decimals)}`
+                : `amount: ${amount}`,
+              ...(withdrawAll && !externalYieldAmount.isZero()
+                ? [
+                    `external yield: ${formatUiAmount(externalYieldAmount, mint.decimals)} stays in the strategy; give an amount to withdraw it`,
+                  ]
+                : []),
             ].join("\n"),
           },
           (txSig) =>

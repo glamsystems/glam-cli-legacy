@@ -122,7 +122,7 @@ export function tarballFiles(gzipped) {
   const tar = gunzipSync(gzipped);
   const files = new Map();
   let pax = null;
-  for (let offset = 0; offset + 512 <= tar.length; ) {
+  for (let offset = 0; offset + 512 <= tar.length;) {
     const header = tar.subarray(offset, offset + 512);
     offset += 512;
     if (header.every((byte) => byte === 0)) continue;
@@ -197,7 +197,7 @@ export function tarballFiles(gzipped) {
 // byte count, so this reader refuses one.
 function paxRecords(body) {
   const records = {};
-  for (let rest = body; rest.length > 0; ) {
+  for (let rest = body; rest.length > 0;) {
     const space = rest.indexOf(0x20);
     const digits = rest.subarray(0, Math.max(space, 0)).toString("latin1");
     const length = /^[1-9][0-9]*$/.test(digits) ? Number(digits) : 0;
@@ -279,13 +279,11 @@ export async function assertNpmEntries(gzipped) {
         refusals.push(
           `npm reads ${path} as ${entry.type}, which is not a regular file or a directory`,
         );
-      else if (
-        !(
-          parts.length > 1 &&
-          parts[0] === "package" &&
-          parts.every((part) => part && part !== "." && part !== "..")
-        )
-      )
+      else if (!(
+        parts.length > 1 &&
+        parts[0] === "package" &&
+        parts.every((part) => part && part !== "." && part !== "..")
+      ))
         refusals.push(`npm reads ${path}, which is outside package/`);
       else if (seen.has(path)) refusals.push(`npm reads ${path} twice`);
       seen.add(path);

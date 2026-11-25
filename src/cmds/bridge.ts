@@ -14,6 +14,7 @@ import {
   MAX_COST_BPS,
   MAX_ROUTE_CHAINS,
   RouteManagementMode,
+  U64_MAX_BN,
   USDC,
   USDC_DEVNET,
   USDT,
@@ -24,8 +25,10 @@ import { Command, Option } from "commander";
 import {
   type CliContext,
   executeTxWithErrorHandling,
+  formatUiAmount,
   resolveTokenPublicKey,
 } from "../utils";
+import { fail } from "../errors";
 import {
   collectArrayValues,
   collectPublicKeys,
@@ -35,7 +38,6 @@ import {
   parseNonNegativeUiAmount,
   parseOptionalHexOrBase64Bytes,
   parsePositiveBn,
-  parsePositiveInteger,
   parsePositiveUiAmount,
   parseU32,
   validatePublicKey,
@@ -168,6 +170,24 @@ type RouteUpdateOptions = RouteOptions & {
 
 /** The route an update patches, and the set it was read from. */
 type RouteBase = { route: BridgeRoute; set: RouteSetName };
+
+// A LayerZero endpoint id is a u32, and 0 names no endpoint.
+function parseDestinationChain(value: string): number {
+  const chain = parseU32(value, "destination-chain");
+  if (chain === 0) {
+    fail("destination-chain must be a positive integer");
+  }
+  return chain;
+}
+
+// The program takes a CCTP route's finality floor as one of these two values.
+function parseMinFinality(value: string): number {
+  const threshold = parseU32(value, "min-finality");
+  if (threshold !== 1000 && threshold !== 2000) {
+    fail("min-finality must be 1000 (confirmed) or 2000 (finalized)");
+  }
+  return threshold;
+}
 
 function parseCostBps(value: string, label: string): number {
   const parsed = parseNonNegativeInteger(value, label);
@@ -545,18 +565,6 @@ function printRouteSets(sets: RouteSets) {
     // every send, which `pending: null` alone does not say.
     pendingCleared: sets.pendingCleared,
   });
-}
-
-/** A base-unit amount in UI units of `decimals`, exact for any u64. */
-function formatUiAmount(amount: BN, decimals: number): string {
-  const scale = new BN(10).pow(new BN(decimals));
-  const whole = amount.div(scale).toString();
-  const fraction = amount
-    .mod(scale)
-    .toString()
-    .padStart(decimals, "0")
-    .replace(/0+$/, "");
-  return fraction ? `${whole}.${fraction}` : whole;
 }
 
 function formatLimits(limits: RouteLimits, decimals: number): string {
@@ -1076,7 +1084,7 @@ function installCctpRouteCommands(program: Command, context: CliContext) {
             "Finality floor: 1000 (confirmed, fast) or 2000 (finalized)",
             verb,
           ),
-          (value: string) => parseNonNegativeInteger(value, "min-finality"),
+          parseMinFinality,
           verb === "add" ? 2000 : undefined,
         )
         .option("-y, --yes", "Skip confirmation", false),
@@ -1090,11 +1098,12 @@ function installCctpRouteCommands(program: Command, context: CliContext) {
       options: NewRouteOptions & CctpOptions & { minFinality: number },
     ) => {
       // The SDK's CCTP send builder takes the same cluster selection.
-      const sourceMint = options.sourceMint
-        ? await resolveTokenPublicKey(context.glamClient, options.sourceMint)
-        : context.glamClient.isMainnet
-          ? USDC
-          : USDC_DEVNET;
+      const sourceMint =
+        options.sourceMint !== undefined
+          ? await resolveTokenPublicKey(context.glamClient, options.sourceMint)
+          : context.glamClient.isMainnet
+            ? USDC
+            : USDC_DEVNET;
       const decimals = await mintDecimals(context, sourceMint);
       const route = buildRoute(
         {
@@ -1105,9 +1114,12 @@ function installCctpRouteCommands(program: Command, context: CliContext) {
         domains,
         {
           cctp: {
-            destinationCaller: options.destinationCaller
-              ? parseDestinationCaller(options.destinationCaller)
-              : PublicKey.default,
+            // The default key lets anyone deliver. An empty value is read,
+            // and refused, like any other: only an option left out means it.
+            destinationCaller:
+              options.destinationCaller !== undefined
+                ? parseDestinationCaller(options.destinationCaller)
+                : PublicKey.default,
             minFinalityThreshold: options.minFinality,
           },
         },
@@ -1136,9 +1148,10 @@ function installCctpRouteCommands(program: Command, context: CliContext) {
     ) => {
       const recipient = parseRecipientPublicKey(destinationRecipient);
       const sets = await context.glamClient.bridge.cctp.fetchRouteSets();
-      const sourceMint = options.sourceMint
-        ? await resolveTokenPublicKey(context.glamClient, options.sourceMint)
-        : soleRouteMint(sets, recipient, tokenMessengerMinter, "CCTP");
+      const sourceMint =
+        options.sourceMint !== undefined
+          ? await resolveTokenPublicKey(context.glamClient, options.sourceMint)
+          : soleRouteMint(sets, recipient, tokenMessengerMinter, "CCTP");
       const base = routeToPatch(
         sets,
         {
@@ -1383,9 +1396,7 @@ function installLayerzeroOftCommands(program: Command, context: CliContext) {
       validatePublicKey,
     )
     .argument("<sender>", "Sender public key", validatePublicKey)
-    .argument("<destination-chain>", "", (value: string) =>
-      parsePositiveInteger(value, "destination-chain"),
-    )
+    .argument("<destination-chain>", "", parseDestinationChain)
     .argument("<destination-recipient>")
     .description("Derive the LayerZero nonce PDA for an OFT route")
     .action(
@@ -1408,23 +1419,22 @@ function installLayerzeroOftCommands(program: Command, context: CliContext) {
   program
     .command("send-usdt")
     .argument("<amount>", "USDT amount in UI units")
-    .argument("<destination-chain>", "", (value: string) =>
-      parsePositiveInteger(value, "destination-chain"),
-    )
+    .argument("<destination-chain>", "", parseDestinationChain)
     .argument("<destination-recipient>")
     .requiredOption(
       "--native-fee-lamports <lamports>",
       "LayerZero native fee in lamports/base units",
-      (value: string) => parsePositiveBn(value, "native-fee-lamports"),
+      (value: string) =>
+        parsePositiveBn(value, "native-fee-lamports", U64_MAX_BN),
     )
     .option(
       "--min-amount <amount>",
-      "Minimum destination amount in UI units; by default the amount less the live route's cost bound on this chain, or 99.5 % of the amount when no live route is readable",
+      "Minimum destination amount in UI units, refused under the live route's cost bound on this chain; by default the amount less that bound, or 99.5 % of the amount when no live route is readable",
     )
     .option(
       "--lz-token-fee <amount>",
       "Optional LayerZero token fee in base units",
-      (value: string) => parsePositiveBn(value, "lz-token-fee"),
+      (value: string) => parsePositiveBn(value, "lz-token-fee", U64_MAX_BN),
     )
     .option(
       "--options <hex-or-base64>",
@@ -1466,42 +1476,65 @@ function installLayerzeroOftCommands(program: Command, context: CliContext) {
         }: OftSendOptions,
       ) => {
         const transferId = Keypair.generate().publicKey;
+        // Every input is read before the confirmation, which shows the amount.
+        const sourceAmount = parsePositiveUiAmount(amount, 6, "amount");
+        const givenMinAmount =
+          minAmount !== undefined
+            ? parsePositiveUiAmount(minAmount, 6, "min-amount")
+            : undefined;
+        // The program refuses a quote above the amount sent.
+        if (givenMinAmount?.gt(sourceAmount)) {
+          fail(
+            `min-amount ${minAmount!.trim()} USDT is above the ${amount.trim()} USDT sent, and the program refuses a quote above the amount`,
+          );
+        }
+        const destination = parseRecipientPublicKey(destinationRecipient);
+        // The floor the send carries, resolved once and shown: without
+        // --min-amount, the live route's cost bound on the chain, else the
+        // route profile's default. A floor or amount the live route refuses
+        // stops here, before the confirmation.
+        const minAmountLd =
+          await context.glamClient.bridge.oft.resolveMinAmountLd({
+            sourceMint: USDT,
+            sourceAmount,
+            destinationChain,
+            destinationRecipient: destination,
+            minAmountLd: givenMinAmount,
+          });
+        const sendParams = {
+          transferId,
+          sourceMint: USDT,
+          sourceAmount,
+          destinationChain,
+          destinationRecipient: destination,
+          nativeFeeLamports,
+          minAmountLd,
+          lzTokenFee,
+          options:
+            options !== undefined
+              ? parseHexOrBase64Bytes(options, "options")
+              : undefined,
+          composeMsg: parseOptionalHexOrBase64Bytes(composeMsg, "composeMsg"),
+          managed,
+        };
 
         await executeTxWithErrorHandling(
           () =>
-            context.glamClient.bridge.oft.send(
-              {
-                transferId,
-                sourceMint: USDT,
-                sourceAmount: parsePositiveUiAmount(amount, 6, "amount"),
-                destinationChain,
-                destinationRecipient:
-                  parseRecipientPublicKey(destinationRecipient),
-                nativeFeeLamports,
-                minAmountLd: minAmount
-                  ? parsePositiveUiAmount(minAmount, 6, "min-amount")
-                  : undefined,
-                lzTokenFee,
-                options: options
-                  ? parseHexOrBase64Bytes(options, "options")
-                  : undefined,
-                composeMsg: parseOptionalHexOrBase64Bytes(
-                  composeMsg,
-                  "composeMsg",
-                ),
-                managed,
-              },
-              {
-                ...context.txOptions,
-                lookupTables:
-                  lookupTable.length > 0
-                    ? lookupTable
-                    : context.txOptions.lookupTables,
-              },
-            ),
+            context.glamClient.bridge.oft.send(sendParams, {
+              ...context.txOptions,
+              lookupTables:
+                lookupTable.length > 0
+                  ? lookupTable
+                  : context.txOptions.lookupTables,
+            }),
           {
             skip: yes,
-            message: `Confirm LayerZero OFT send of ${amount} USDT to ${destinationRecipient} on chain ${destinationChain}?`,
+            // The floor and both fees go out with the amount.
+            message: `Confirm LayerZero OFT send of ${amount.trim()} USDT to ${destinationRecipient} on chain ${destinationChain}, receiving at least ${formatUiAmount(minAmountLd, 6)} USDT, native fee ${nativeFeeLamports.toString()} lamports${
+              lzTokenFee !== undefined
+                ? `, LayerZero token fee ${lzTokenFee.toString()} base units`
+                : ""
+            }?`,
           },
           (txSig) =>
             `LayerZero OFT transfer submitted: ${txSig}\nTransfer ID: ${transferId}`,

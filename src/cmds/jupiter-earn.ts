@@ -2,6 +2,7 @@ import { BN } from "@coral-xyz/anchor";
 import {
   fetchMintAndTokenProgram,
   getFTokenMintPda,
+  JUPITER_EARN_PROTOCOL,
   JupiterEarnPolicy,
   PkSet,
 } from "@glamsystems/glam-sdk";
@@ -15,7 +16,25 @@ import {
   resolveTokenMint,
   resolveTokenPublicKey,
 } from "../utils";
-import { parsePositiveUiAmount } from "../parsing";
+import {
+  editsStagedLine,
+  readVaultTimelock,
+  type VaultTimelock,
+} from "../staging";
+import { parseNonNegativeUiAmount, parsePositiveUiAmount } from "../parsing";
+
+/** The Jupiter Earn policy an edit replaces: the staged one under a timelock that holds one. */
+async function jupiterEarnPolicyToEdit(
+  context: CliContext,
+  timelock: VaultTimelock,
+) {
+  return timelock.policy(
+    () => context.glamClient.jupiterEarn.fetchPolicy(),
+    () => context.glamClient.extJupiterProgram.programId,
+    JUPITER_EARN_PROTOCOL,
+    JupiterEarnPolicy.decode,
+  );
+}
 
 export function installJupiterEarnCommands(
   earnProgram: Command,
@@ -41,9 +60,9 @@ export function installJupiterEarnCommands(
     .description("Add a token to the Jupiter Earn allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy =
-        (await context.glamClient.jupiterEarn.fetchPolicy()) ??
-        new JupiterEarnPolicy([]);
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterEarnPolicyToEdit(context, timelock);
+      const policy = base.value ?? new JupiterEarnPolicy([]);
       if (new PkSet(policy.mintsAllowlist).has(token)) {
         console.error(
           `Token ${token} is already in the Jupiter Earn allowlist`,
@@ -56,9 +75,16 @@ export function installJupiterEarnCommands(
           context.glamClient.jupiterEarn.setPolicy(policy, context.txOptions),
         {
           skip: !!options?.yes,
-          message: `Confirm adding token ${token} to Jupiter Earn allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm adding token ${token} to Jupiter Earn allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Earn allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) => `Token ${token} added to Jupiter Earn allowlist: ${txSig}`,
+        timelock.outcome(`Token ${token} added to Jupiter Earn allowlist`),
       );
     });
 
@@ -70,9 +96,13 @@ export function installJupiterEarnCommands(
     .description("Remove a token from the Jupiter Earn allowlist")
     .action(async (tokenInput: string, options: { yes?: boolean }) => {
       const token = await resolveTokenPublicKey(context.glamClient, tokenInput);
-      const policy = await context.glamClient.jupiterEarn.fetchPolicy();
+      const timelock = await readVaultTimelock(context);
+      const base = await jupiterEarnPolicyToEdit(context, timelock);
+      const policy = base.value;
       if (!policy) {
-        console.error("No policy found");
+        console.error(
+          `No policy found${base.stagedApart ? " in the staged change" : ""}`,
+        );
         process.exit(1);
       }
       if (!policy.mintsAllowlist.find((m) => m.equals(token))) {
@@ -89,10 +119,16 @@ export function installJupiterEarnCommands(
           context.glamClient.jupiterEarn.setPolicy(policy, context.txOptions),
         {
           skip: options?.yes ?? false,
-          message: `Confirm removing token ${token} from Jupiter Earn allowlist`,
+          message: timelock.confirm(
+            [
+              `Confirm removing token ${token} from Jupiter Earn allowlist`,
+              ...(base.stagedApart
+                ? [editsStagedLine("the Jupiter Earn allowlist")]
+                : []),
+            ].join("\n"),
+          ),
         },
-        (txSig) =>
-          `Token ${token} removed from Jupiter Earn allowlist: ${txSig}`,
+        timelock.outcome(`Token ${token} removed from Jupiter Earn allowlist`),
       );
     });
 
@@ -127,13 +163,16 @@ export function installJupiterEarnCommands(
           context.glamClient.connection,
           getFTokenMintPda(mint),
         );
-        const minAmountOut = options.minOut
-          ? parsePositiveUiAmount(
-              options.minOut,
-              fTokenMint.decimals,
-              "min-out",
-            )
-          : new BN(0);
+        // 0 is the floor sent without the option, so it is a value to take.
+        // An empty value is read, and refused, like any other.
+        const minAmountOut =
+          options.minOut !== undefined
+            ? parseNonNegativeUiAmount(
+                options.minOut,
+                fTokenMint.decimals,
+                "min-out",
+              )
+            : new BN(0);
         await executeTxWithErrorHandling(
           () =>
             context.glamClient.jupiterEarn.deposit(
@@ -144,7 +183,7 @@ export function installJupiterEarnCommands(
             ),
           {
             skip: options.yes ?? false,
-            message: `Confirm Jupiter Earn deposit ${amount} ${token}`,
+            message: `Confirm Jupiter Earn deposit ${amount} ${token} (minimum fTokens out: ${options.minOut?.trim() ?? "0"})`,
           },
           (txSig) => `Jupiter Earn deposit of ${amount} ${token}: ${txSig}`,
         );
@@ -182,13 +221,14 @@ export function installJupiterEarnCommands(
           context.glamClient.connection,
           getFTokenMintPda(mint),
         );
-        const maxSharesBurn = options.maxShares
-          ? parsePositiveUiAmount(
-              options.maxShares,
-              fTokenMint.decimals,
-              "max-shares",
-            )
-          : undefined;
+        const maxSharesBurn =
+          options.maxShares !== undefined
+            ? parsePositiveUiAmount(
+                options.maxShares,
+                fTokenMint.decimals,
+                "max-shares",
+              )
+            : undefined;
         await executeTxWithErrorHandling(
           () =>
             context.glamClient.jupiterEarn.withdraw(
@@ -199,7 +239,7 @@ export function installJupiterEarnCommands(
             ),
           {
             skip: options.yes ?? false,
-            message: `Confirm Jupiter Earn withdraw ${amount} ${token}`,
+            message: `Confirm Jupiter Earn withdraw ${amount} ${token} (maximum fTokens burned: ${options.maxShares?.trim() ?? "no limit"})`,
           },
           (txSig) => `Jupiter Earn withdraw of ${amount} ${token}: ${txSig}`,
         );

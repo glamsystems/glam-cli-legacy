@@ -1,5 +1,6 @@
 import { type Command } from "commander";
 import { type CliContext, executeTxWithErrorHandling } from "../utils";
+import { fail } from "../errors";
 import { validatePublicKey } from "../parsing";
 import { type PublicKey, Transaction } from "@solana/web3.js";
 import {
@@ -9,6 +10,10 @@ import {
   findGlamLookupTables,
   type VaultAccountsInfo,
 } from "@glamsystems/glam-sdk";
+
+// LOOKUP_TABLE_MAX_ADDRESSES: the most addresses a lookup table holds, and
+// the most a v0 message's one-byte table index can reach.
+const MAX_TABLE_ADDRESSES = 256;
 
 async function getVaultAccountsInfo(
   context: CliContext,
@@ -47,6 +52,13 @@ export function installAltCommands(alt: Command, context: CliContext) {
       const info = await getVaultAccountsInfo(context);
       const addresses = await collectVaultLookupTableAddresses(info);
       console.log(`Collected ${addresses.length} addresses for lookup table`);
+      // The batches go out one transaction at a time, so the first ones and
+      // their rent would land before the table refused one.
+      if (addresses.length > MAX_TABLE_ADDRESSES) {
+        fail(
+          `A lookup table holds at most ${MAX_TABLE_ADDRESSES} addresses, and the vault has ${addresses.length}`,
+        );
+      }
 
       // The slot is an input to the table address derivation and must be in the
       // bank's SlotHashes when the transaction is simulated and sent. A confirmed
@@ -144,6 +156,12 @@ export function installAltCommands(alt: Command, context: CliContext) {
       }
 
       console.log(`Found ${newAddresses.length} new addresses to add`);
+      const held = existingTable.state.addresses.length;
+      if (held + newAddresses.length > MAX_TABLE_ADDRESSES) {
+        fail(
+          `A lookup table holds at most ${MAX_TABLE_ADDRESSES} addresses: ${tableToExtend.toBase58()} holds ${held}, so it takes ${MAX_TABLE_ADDRESSES - held} of the ${newAddresses.length} new ones. Create another table with \`glam alt create\``,
+        );
+      }
 
       const extendIxs = buildExtendAltInstructions(
         tableToExtend,

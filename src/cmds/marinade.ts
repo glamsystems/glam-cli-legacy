@@ -40,9 +40,10 @@ export function installMarinadeCommands(
           ),
         {
           skip: options?.yes,
-          message: `Confirm withdrawing ${amount} mSOL into a stake account`,
+          message: `Confirm withdrawing ${amount} mSOL into a stake account${options.deactivate ? ", then deactivating it (--deactivate)" : ""}`,
         },
-        (txSig) => `Withdraw ${amount} mSOL: ${txSig}`,
+        (txSig) =>
+          `Withdrew ${amount} mSOL into a stake account${options.deactivate ? " and deactivated it" : ""}: ${txSig}`,
       );
     });
 }
