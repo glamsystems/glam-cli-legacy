@@ -29,6 +29,172 @@ release.
 npm install -g @glamsystems/glam-cli@1.3.0
 ```
 
+## Upgrading from 1.3.0
+
+This section is for anyone who runs a command with the protocol name `CCTP`.
+The entries for each command describe a production vault, and "On a staging
+vault" says what differs on staging. The two clean-ups at the end are for a
+production vault on which a CLI release from 1.1.3 to 1.3.0 was used with the
+name.
+
+Two integration programs name a protocol `CCTP`. ext_cctp
+(`G1NTcMDYgNLpDwgnrpSZvoSKQuR9NXG7S3DmtNQCDmrK` on production) is the one the
+`cctp` commands call. ext_bridge
+(`G1NTbnLcjMex9Tjo8ocmNK9S2zBCiGVuxKUUNGhYZztx`) is the one the `bridge`
+commands call, and production does not run it. Every release from 1.1.3 to
+1.3.0 took the name to mean ext_bridge's protocol on every vault. The name now
+means ext_cctp's protocol on a production vault and ext_bridge's on a staging
+vault. No other protocol name is shared.
+
+Both programs keep the name, so a listing prints `CCTP` for either one. The
+program id printed with it tells them apart.
+
+- `integration enable CCTP` enables ext_cctp's protocol on a production vault.
+  1.1.3 to 1.3.0 enabled ext_bridge's there, which the `cctp` commands do not
+  use.
+- `integration disable CCTP` reads the vault's integration list first. Where
+  only ext_bridge enables the protocol, it disables that one and prints a note
+  that names the program. Where both programs enable it, it disables
+  ext_cctp's and says that ext_bridge's stays. 1.1.3 to 1.3.0 disabled
+  ext_bridge's. A disable deletes the stored policy of the protocol it
+  disables, which for ext_cctp's is the destination allowlist. The
+  confirmation says so.
+- `delegate grant --protocol CCTP` takes ext_cctp's permission on a production
+  vault, which is `Transfer`. 1.1.3 to 1.3.0 took ext_bridge's there: `Send`,
+  `Validate` and `Settle`, and from 1.2.0 also `Pause`. Given one of those, the
+  command now names the valid permission and exits with status 1.
+- `delegate revoke --protocol CCTP` resolves the name the same way. It takes
+  `Transfer` and refuses ext_bridge's permissions. So it cannot take back one
+  permission of a grant that 1.1.3 to 1.3.0 made on ext_bridge's protocol. See
+  below for the ways to remove such a grant.
+- `integration list` prints each integration program's id with the protocols
+  enabled on it. An entry that 1.1.3 to 1.3.0 made prints `CCTP` after
+  ext_bridge's id. One made since prints `CCTP` after ext_cctp's.
+- `delegate list` prints a delegate's permissions under each program's id. A
+  grant that 1.1.3 to 1.3.0 made prints as `CCTP: Send`, or with another of
+  ext_bridge's permissions, under ext_bridge's id. One made since prints as
+  `CCTP: Transfer` under ext_cctp's.
+
+What each `cctp` command needs is on ext_cctp's protocol:
+
+- `cctp bridge-usdc` needs the protocol enabled and a destination that the
+  stored policy allows. The vault owner can run it, and so can a delegate with
+  the `Transfer` permission.
+- `cctp allowlist-destination` and `cctp remove-destination` set the policy.
+  They need the protocol enabled, and only the vault owner can run them.
+- `cctp view-policy` and `cctp list` only read.
+- `cctp receive` sends Circle's receive instruction and no instruction of a
+  GLAM program, so it needs nothing enabled on the vault.
+
+`integration enable CCTP` enables the protocol, and
+`delegate grant <pubkey> --protocol CCTP Transfer` gives a delegate the
+permission.
+
+### On a staging vault
+
+The name `CCTP` means ext_bridge's protocol on a staging vault, as in every
+release since 1.1.3. `integration enable`, `delegate grant` and
+`delegate revoke` act on ext_bridge's protocol there as before, so
+`integration enable CCTP` does not enable the protocol the `cctp` commands
+need. An SDK caller names the program instead:
+`client.access.enableProtocols(integrationProgram, protocolBitmask)` enables
+the protocol, and
+`client.access.grantDelegatePermissions(delegate, integrationProgram, protocolBitflag, permissionsBitmask)`
+gives a delegate its `Transfer` permission. On staging, ext_cctp is
+`gstgcuRwiX2FpmtigowB1TnVi3fPkZC9TEmVnc5sdxW` and ext_bridge is
+`gstgxS9yTioViNKdsM4DC33k1TU9un2VCYDQK8fAeSA`.
+
+One command changed. `integration disable CCTP` reads the integration list it
+edits. Where that list enables ext_cctp's protocol and not ext_bridge's, the
+command now disables ext_cctp's and deletes its destination allowlist. 1.1.3 to
+1.3.0 sent the disable to ext_bridge's protocol there, which left ext_cctp's
+protocol and its allowlist as they were. Where the list enables both, the
+command disables ext_bridge's, as before, and says that ext_cctp's stays. A
+second run then disables ext_cctp's. `integration enable CCTP` does not undo a
+disable of ext_cctp's protocol, since the name means ext_bridge's there.
+
+In both cases the command prints a note that names the two programs, and its
+confirmation names the id of the program it acts on and says when it deletes a
+stored policy. Run it without `--yes`.
+
+On a vault with a timelock the command edits the staged list where a staged
+change holds one, which `integration list` does not print, and the disable is
+staged until `timelock apply`. `timelock cancel` drops every staged change.
+
+### A production vault that lists ext_bridge's protocol
+
+One check holds in every state. `integration disable` asks for confirmation,
+and the confirmation names the id of the program it acts on and says when it
+deletes a stored policy. Run it without `--yes`, and answer no when it names
+ext_cctp's id and that is not what you meant.
+
+On a vault without a timelock, `integration list` shows which of the two ids
+has `CCTP` after it:
+
+- Only ext_bridge's. `integration disable CCTP` disables ext_bridge's
+  protocol. Then `integration enable CCTP` enables ext_cctp's.
+- Both. `integration disable CCTP` would disable ext_cctp's protocol and
+  delete its destination allowlist. Run
+  `integration disable-all G1NTbnLcjMex9Tjo8ocmNK9S2zBCiGVuxKUUNGhYZztx`, which
+  removes ext_bridge's entry and leaves ext_cctp's as it is.
+
+On a vault with a timelock, `integration list` prints the live list, which
+`integration enable` and `integration disable` do not change until
+`timelock apply`, and `integration disable` edits the staged list where a
+staged change holds one. Run each command once and read `timelock view` before
+the next. It prints what a staged change adds and removes with the first eight
+characters of a program's id: `G1NTbnLc` is ext_bridge's and `G1NTcMDY` is
+ext_cctp's. `timelock cancel` drops every staged change.
+
+`integration disable-all` is an emergency update. It changes the live list at
+once, it refuses a program that is not on the live list, and a change already
+staged that still lists the program brings it back on `timelock apply`.
+"Command lines that send something else" under "Upgrading to 1.3.0" has the
+entry on emergency updates.
+
+Where the live list holds no entry for ext_bridge, `integration disable-all`
+refuses ext_bridge's id, and `integration disable CCTP` acts on ext_cctp's
+protocol where the staged list enables both. The refusal says which program
+that command would act on. An SDK caller removes the staged entry alone with
+`client.access.disableProtocols(integrationProgram, protocolBitmask)`, which
+the refusal prints with the id and the mask filled in. Like any staged change,
+that call restarts the timelock's wait for everything staged. `timelock cancel`
+drops every staged change.
+
+### A grant on ext_bridge's protocol on a production vault
+
+A grant that 1.1.3 to 1.3.0 made by the name gives a delegate permissions on
+ext_bridge's protocol. While that protocol is disabled the permissions cannot
+be used, because the program checks that the protocol is enabled first. The
+delegate stays listed on the vault all the same, and a few instructions accept
+any listed delegate. So remove the grant, in one of three ways:
+
+- Run the revoke with one of those releases, where the name still means
+  ext_bridge's protocol:
+  `npx @glamsystems/glam-cli@1.3.0 delegate revoke <pubkey> --protocol CCTP Send`.
+  `npx` runs that one command and leaves the installed release as it is. An
+  older release installed with `npm install -g` replaces the current one, and
+  its `integration enable CCTP` enables ext_bridge's protocol again. 1.2.0 to
+  1.3.0 take all four permission names, and 1.1.3 takes `Send`, `Validate` and
+  `Settle`. On a vault with a timelock the revoke is staged like any other.
+- An SDK caller names the program itself:
+  `client.access.revokeDelegatePermissions(delegate, integrationProgram, protocolBitflag, permissionsBitmask)`.
+- `delegate revoke-all <pubkey>` removes the delegate from the vault with every
+  permission it holds, on every integration, and with its expiry. Grant again
+  what the delegate should keep. It costs more than the other two ways, which
+  keep the delegate's entry while it holds another permission:
+  - The delegate comes back without an expiry. A grant to a delegate the vault
+    does not list makes an entry that never expires, and nothing sets an
+    expiry on an existing vault.
+  - It is an emergency update, so it applies at once, and a change already
+    staged that still lists the delegate brings it back on `timelock apply`.
+    On a vault with a timelock the grants made again are staged, so the
+    delegate holds nothing until `timelock apply`. Where a change already
+    staged lists the delegate, a grant made again is added to that staged
+    entry, which keeps whatever it holds on ext_bridge's protocol, so use
+    one of the first two ways there.
+  - It refuses a delegate that holds an active `CancelTimelock` permission.
+
 ## Upgrading to 1.3.0
 
 1.3.0 is a minor release with breaking changes. This section lists what a

@@ -1,6 +1,7 @@
 import {
   formatBits,
   getProgramAndBitflagByProtocolName,
+  getProtocolsAndPermissions,
   parseProtocolsBitmask,
 } from "@glamsystems/glam-sdk";
 import { type Command } from "commander";
@@ -39,6 +40,89 @@ function resolveProtocolNames(
   }
 
   return groups;
+}
+
+/** A protocol by the integration program that hosts it and its bit. */
+type HostedProtocol = { program: PublicKey; bitflag: number };
+
+/** Every protocol that carries a name. Two programs name a protocol "CCTP". */
+function protocolsNamed(name: string, staging: boolean): HostedProtocol[] {
+  return Object.entries(getProtocolsAndPermissions(staging)).flatMap(
+    ([programId, protocols]) =>
+      Object.entries(protocols)
+        .filter(([, protocol]) => protocol.name === name)
+        .map(([bitflag]) => ({
+          program: new PublicKey(programId),
+          bitflag: parseInt(bitflag, 2),
+        })),
+  );
+}
+
+/**
+ * Whether a list enables a protocol, as glam_protocol reads it: any entry
+ * for the program that holds the protocol's bit.
+ */
+function enables(acls: Acl[], { program, bitflag }: HostedProtocol): boolean {
+  return acls.some(
+    (acl) =>
+      acl.integrationProgram.equals(program) &&
+      (acl.protocolsBitmask & bitflag) !== 0,
+  );
+}
+
+/**
+ * The protocols `integration disable` removes for the names given, grouped
+ * per integration program, and what to tell the user about them.
+ *
+ * A name one program carries means that program's protocol. A name two
+ * programs carry means the one the list to edit enables: the deployment's
+ * own where the list enables it, and the other where the list enables only
+ * that. CLI 1.3.0 enabled ext_bridge's protocol for the name CCTP on a
+ * production vault, and disabling ext_cctp's there changes nothing.
+ */
+function protocolsToDisable(
+  names: string[],
+  staging: boolean,
+  acls: Acl[],
+): { groups: Record<string, number>; notes: string[] } {
+  const lookup = getProgramAndBitflagByProtocolName(staging);
+  const groups: Record<string, number> = {};
+  const notes: string[] = [];
+
+  for (const name of names) {
+    const [programIdStr, bitflagStr] = lookup[name];
+    const byDeployment: HostedProtocol = {
+      program: new PublicKey(programIdStr),
+      bitflag: parseInt(bitflagStr, 2),
+    };
+    const enabledElsewhere = protocolsNamed(name, staging).filter(
+      (protocol) =>
+        !protocol.program.equals(byDeployment.program) &&
+        enables(acls, protocol),
+    );
+
+    let target = byDeployment;
+    if (enabledElsewhere.length > 0) {
+      const elsewhere = enabledElsewhere
+        .map(({ program }) => program.toBase58())
+        .join(", ");
+      if (enables(acls, byDeployment)) {
+        notes.push(
+          `Note: ${name} is also enabled on ${elsewhere}. This disables it on ${byDeployment.program} only. Run the command again to disable it there too.`,
+        );
+      } else {
+        [target] = enabledElsewhere;
+        notes.push(
+          `Note: ${name} is enabled on ${target.program}, not on ${byDeployment.program}. This disables it on ${target.program}.`,
+        );
+      }
+    }
+
+    const programId = target.program.toBase58();
+    groups[programId] = (groups[programId] || 0) | target.bitflag;
+  }
+
+  return { groups, notes };
 }
 
 /**
@@ -82,6 +166,50 @@ function stagedComesBack(
         `A change already staged still lists ${program}: \`glam timelock apply\` puts the staged list in place and brings it back. \`glam timelock cancel\` drops the staged changes.`,
       ]
     : [];
+}
+
+/**
+ * What to do about a program that only the staged list holds, which an
+ * emergency disable does not reach. `integration disable` picks its program
+ * from the names it is given, so the hint asks what that command would act on
+ * and names it only where that is this program's whole staged entry.
+ */
+function stagedOnlyHint(
+  timelock: VaultTimelock,
+  program: PublicKey,
+  staging: boolean,
+): string {
+  const cancel = "`glam timelock cancel` drops the staged changes";
+  const acls = timelock.aclsToEdit();
+  const mask = acls
+    .filter((acl) => acl.integrationProgram.equals(program))
+    .reduce((bits, acl) => bits | acl.protocolsBitmask, 0);
+  if (mask === 0) {
+    return `A change already staged lists it, and ${cancel}`;
+  }
+
+  const id = program.toBase58();
+  const lookup = getProgramAndBitflagByProtocolName(staging);
+  const names = parseProtocolsBitmask(program, mask, staging).protocols.map(
+    ({ name }) => name,
+  );
+  const command = `\`glam integration disable ${names.join(" ")}\``;
+  const groups = names.every((name) => lookup[name])
+    ? protocolsToDisable(names, staging, acls).groups
+    : {};
+  const targets = Object.keys(groups);
+  if (targets.length === 1 && groups[id] === mask) {
+    return `A change already staged lists it: ${command} removes it from the staged list, and ${cancel}`;
+  }
+
+  const others = targets.filter((target) => target !== id);
+  return [
+    "A change already staged lists it.",
+    ...(others.length > 0
+      ? [`${command} would act on ${targets.join(", ")} there.`]
+      : []),
+    `An SDK caller removes it from the staged list alone with \`client.access.disableProtocols(new PublicKey("${id}"), 0b${formatBits(mask)})\`, which restarts the timelock's wait for what is already staged, and ${cancel}`,
+  ].join(" ");
 }
 
 export function installIntegrationCommands(
@@ -179,10 +307,16 @@ export function installIntegrationCommands(
     )
     .option("-y, --yes", "Skip confirmation")
     .action(async (protocols: string[], { yes }) => {
-      const groups = resolveProtocolNames(
-        protocols,
-        context.glamClient.staging,
+      const staging = context.glamClient.staging;
+      const requested = parseArrayInput(protocols).map((name) =>
+        resolveProtocolName(name, staging),
       );
+
+      // The program to edit is read from the list the change applies to.
+      const timelock = await readVaultTimelock(context);
+      const acls = timelock.aclsToEdit();
+      const { groups, notes } = protocolsToDisable(requested, staging, acls);
+      notes.forEach((note) => console.log(note));
 
       const details = Object.entries(groups).map(([pid, mask]) => {
         const { protocols } = parseProtocolsBitmask(
@@ -194,8 +328,6 @@ export function installIntegrationCommands(
         return `${pid} -> ${names}`;
       });
 
-      const timelock = await readVaultTimelock(context);
-      const acls = timelock.aclsToEdit();
       const deleted = Object.entries(groups).flatMap(([pid, mask]) =>
         deletedPolicies(
           acls,
@@ -256,7 +388,7 @@ export function installIntegrationCommands(
         fail(
           `Integration ${integrationProgram} is not in the vault's integration list, so an emergency disable changes nothing${
             timelock.stagedListHolds("integrationAcls", integrationProgram)
-              ? `. A change already staged lists it: \`glam integration disable\` edits the staged list, and \`glam timelock cancel\` drops the staged changes`
+              ? `. ${stagedOnlyHint(timelock, integrationProgram, context.glamClient.staging)}`
               : ""
           }`,
         );

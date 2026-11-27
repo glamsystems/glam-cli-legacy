@@ -189,19 +189,22 @@ export function installKaminoFarmsCommands(
   kfarms
     .command("harvest")
     .argument(
-      "<farm-states...>",
-      "Vault-owned farm states to harvest rewards from, comma- or space-separated",
+      "<farm-user-states...>",
+      "The vault's farm user states to harvest rewards from, the vaultFarmUser addresses `kamino-farms list` prints (not farm states), comma- or space-separated",
       collectPublicKeys,
     )
     .option("-y, --yes", "Skip confirmation prompt", false)
     .description("Harvest rewards from Kamino farms")
-    .action(async (farmStates: PublicKey[], options) => {
+    .action(async (farmUserStates: PublicKey[], options) => {
       await executeTxWithErrorHandling(
         () =>
-          context.glamClient.kaminoFarm.harvest(farmStates, context.txOptions),
+          context.glamClient.kaminoFarm.harvest(
+            farmUserStates,
+            context.txOptions,
+          ),
         {
           skip: options?.yes,
-          message: `Confirm harvesting farm rewards from ${farmStates.length} farms`,
+          message: `Confirm harvesting farm rewards from ${farmUserStates.length} farm user state${farmUserStates.length === 1 ? "" : "s"}`,
         },
         (txSig) => `Harvested farm rewards: ${txSig}`,
       );

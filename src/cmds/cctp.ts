@@ -59,7 +59,7 @@ function encodedDestination(destination: PublicKey): string {
  * A stored destination as it reads: an EVM address where its first 12 bytes
  * are zero, and all 32 bytes otherwise, which the address's 20 would cut.
  */
-function shownDestination(destination: PublicKey): string {
+export function shownDestination(destination: PublicKey): string {
   return destination
     .toBytes()
     .subarray(0, 12)

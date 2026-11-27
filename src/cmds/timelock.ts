@@ -1,6 +1,7 @@
 import { type Command } from "commander";
 import { type CliContext, executeTxWithErrorHandling } from "../utils";
 import { describeDuration, readVaultTimelock } from "../staging";
+import { runsAuditedMint, stagedPolicyLines } from "../staged-policies";
 import { stagedRouteChanges } from "./bridge";
 import { type PublicKey } from "@solana/web3.js";
 import { parseU32 } from "../parsing";
@@ -56,12 +57,32 @@ export function installTimelockCommands(program: Command, context: CliContext) {
               context.glamClient.staging,
             );
 
+            // A staged list can enable the same protocols and store another
+            // policy, as a staged minimum subscription does.
+            const policyLines = stagedPolicyLines(
+              diff.policyChanges,
+              context.glamClient.staging,
+              await runsAuditedMint(
+                diff.policyChanges,
+                context.glamClient.staging,
+                context.glamClient.connection,
+              ),
+            );
+
             if (
               diff.added.length === 0 &&
               diff.removed.length === 0 &&
-              diff.modified.length === 0
+              diff.modified.length === 0 &&
+              policyLines.length === 0
             ) {
-              console.log("  integrationAcls: No changes to enabled protocols");
+              // A list can hold a program, or a protocol's policy, more than
+              // once. The program reads the first, so a staged list can
+              // differ only in entries it never reads.
+              console.log(
+                diff.identical
+                  ? "  integrationAcls: No changes"
+                  : "  integrationAcls: No change to the enabled protocols or the policies the program reads. The stored entries differ.",
+              );
               continue;
             }
 
@@ -115,6 +136,12 @@ export function installTimelockCommands(program: Command, context: CliContext) {
                   );
                 }
               });
+            }
+
+            // Show added, removed and replaced policies
+            if (policyLines.length > 0) {
+              console.log("    Policy changes (amounts in base units):");
+              policyLines.forEach((line) => console.log(`      ${line}`));
             }
           } else if (name === "delegateAcls") {
             // Compare current and staged delegateAcls
@@ -248,8 +275,8 @@ export function installTimelockCommands(program: Command, context: CliContext) {
         console.log("\nNo pending state updates.");
       }
 
-      // The comparison above reads protocol bits only, and a staged route set changes a policy
-      // hash under the same bits, so the bridge routes are compared here.
+      // A bridge protocol's stored policy is a hash of its route set, so a staged route set
+      // shows above as a policy of other bytes, and the routes are compared here.
       if (stateModel.pendingStateUpdates?.integrationAcls) {
         const routeLines = await stagedRouteChanges(context);
         if (routeLines.length > 0) {
